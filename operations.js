@@ -380,12 +380,13 @@ export async function recordJobRun(job, failed) {
 // needs doing, and when the job runs again. The host keeps about an hour of logs, so the email points to /health/deep, and
 // the error as the app gave it goes on the last line, keys withheld, for whoever debugs it.
 
-// Each job's own lines. A nightly step says for itself what its failure means (NIGHTLY_STEPS).
+// Each job's own lines. A nightly step says for itself what its failure means (NIGHTLY_STEPS), and a failure CourtListener
+// caused says what it means for visitors (courtListenerVisitors).
 const JOBS = {
   'case library': {
     opening: "The case library's nightly refresh failed.",
     visitors: 'Visitors are not affected. Replies keep using the decisions the library already holds, and a case type with fewer than 5 cleared decisions is searched on CourtListener live, as before.',
-    again: 'The refresh runs again tomorrow night, and the topics it did not search are first in line.',
+    again: 'The refresh runs again tomorrow night; the topics it did not search keep their place in line.',
   },
   screen: {
     opening: 'The nightly screen of the case library failed.',
@@ -400,24 +401,27 @@ const JOBS = {
   nightly: { again: 'The nightly job runs again tomorrow night.' },
 };
 
+// What to do when the cause is not known: the error at the end of the email may say.
+const FALLBACK_TODO = 'The error below says what went wrong; if it names something to do, do it. If not, and it fails again tomorrow night, it needs a look.';
+const PRIVACY_TODO = 'The error below says what went wrong; if it names something to do, do it. If not, and it fails again tomorrow night, it needs a look: the privacy policy promises the deletion.';
+
 // What the failure of each step of the nightly job (server.js) means, and what to do when it is not the usual.
-const LOOK_TOMORROW = 'Nothing needs doing tonight. If it fails again tomorrow night, it needs a look.';
-const PRIVACY_LOOK = 'Nothing needs doing tonight. If it fails again tomorrow night, it needs a look: the privacy policy promises the deletion.';
 const NIGHTLY_STEPS = {
   'delete old conversations': {
     means: 'Visitors are not affected, but conversations older than 90 days are kept until the step runs well, longer than the privacy policy says.',
-    todo: PRIVACY_LOOK,
+    todo: PRIVACY_TODO,
   },
   'delete old lead records': {
     means: 'Visitors are not affected, but lead records older than 3 years are kept until the step runs well, longer than the privacy policy says.',
-    todo: PRIVACY_LOOK,
+    todo: PRIVACY_TODO,
   },
   'back up business records offsite': {
     means: "Visitors are not affected. Tonight's encrypted copy of the firms, leads, auctions and bids was not made offsite; the last copy made stays.",
   },
-  // An auction past its time is also closed by the next request from a firm or a visitor (sweepExpiredAuctions in server.js).
+  // An auction past its time is also closed by a visitor's chat message and by a firm opening its auction or its portal
+  // (sweepExpiredAuctions in server.js).
   'close expired auctions': {
-    means: 'An auction past its closing time stays open until someone next opens the site, which closes it, or until tomorrow night, so its winning firm may wait for the lead.',
+    means: 'An auction past its closing time stays open until a visitor next sends a chat message or a firm opens its auction or portal page, which closes it, or until tomorrow night, so its winning firm may wait for the lead.',
   },
   'report stuck auctions': {
     means: 'Visitors are not affected. You were not told tonight about any auction stuck while closing (a charge Stripe did not confirm, or a win not recorded).',
@@ -425,8 +429,9 @@ const NIGHTLY_STEPS = {
   'decline overdue leads': {
     means: 'A lead a firm has not answered within 3 days stays with that firm until the step runs, instead of being offered to other firms, so its client waits longer to hear from a firm.',
   },
+  // Refunds and suspensions count a firm's declines from its leads (recentDeclineCounts in firms.js), not the stored counts.
   'recount declines': {
-    means: "Visitors are not affected. A firm's declines older than 30 days may still count toward its refunds and suspension until the counts are redone.",
+    means: "Visitors and firms are not affected: refunds and suspensions count a firm's declines from its leads; this step only tidies the stored counts.",
   },
   'watch the model lists of the providers': {
     means: "Visitors are not affected. Tonight's look at the AI providers' lists of models did not finish; a retirement reminder due tonight, if any, was not sent.",
@@ -439,6 +444,22 @@ const ALL_TOPICS = new Map(Object.values(CASE_TOPICS).flat().map(topic => [topic
 // A topic search as the owner reads it: its words and its id, or the id alone for a topic no longer listed.
 const searchFor = id => (ALL_TOPICS.has(id) ? `the search for "${escapeHtml(ALL_TOPICS.get(id))}" (${escapeHtml(id)})` : `the search for ${escapeHtml(id)}`);
 const decisions = ids => `decision${ids.length === 1 ? '' : 's'} ${listed(ids.map(escapeHtml))}`;
+
+// What a failure CourtListener caused means for visitors, by its status, or null when it says nothing of CourtListener's
+// state. The library and the screen share the token with the replies' own searches (getHeaders in courtlistener.js) and
+// their citation check, which leaves a citation unchecked when CourtListener does not answer (citator.js). A reply for a
+// case type with fewer than 5 cleared decisions searches live, and uses the decisions saved from earlier searches when the
+// search finds nothing (ask.js).
+const SAVED_ONLY = 'for a case type with fewer than 5 cleared decisions they use only the decisions saved from earlier searches, if any, and the citations in replies may be left unchecked.';
+function courtListenerVisitors(status) {
+  if (status === 401 || status === 403) return `Visitors are affected until the token is fixed: replies search CourtListener with the same token, so ${SAVED_ONLY}`;
+  if (status === 429) return `Visitors may be affected until the hour's limit frees up: replies search CourtListener with the same token, so their searches may be refused too. Then, ${SAVED_ONLY}`;
+  if (status === 0 || (status >= 500 && status <= 599)) return `If CourtListener is down, visitors are affected too: replies' live searches fail, so ${SAVED_ONLY}`;
+  return null;
+}
+// Without the token the citation check in replies does not run (citator.js). Nothing else is claimed: CourtListener is not
+// asked how it answers a search sent without one.
+const NO_TOKEN_VISITORS = 'Visitors are affected: the citation check in replies runs only with the token set, so the citations in replies go unchecked until it is set.';
 
 // A CourtListener answer by its status, as the rest of a sentence about where it came: "refused: too many requests ...".
 function courtListenerSaid(status, where, stopped) {
@@ -472,12 +493,29 @@ function plainFailure(error) {
     return { said: courtListenerSaid(status, where, 'the screen'), status };
   }
   match = /^([A-Z][A-Z0-9_]+) is not set in this deployment/.exec(text);
-  if (match) return { said: `The setting ${match[1]} is missing from the deployment, so the job could not start.`, todo: `Set ${match[1]} in the deployment's settings on Vercel, then redeploy.` };
+  if (match) {
+    return {
+      said: `The setting ${match[1]} is missing from the deployment, so the job could not start.`,
+      todo: `Set ${match[1]} in the deployment's settings on Vercel, then redeploy.`,
+      ...(match[1] === 'COURTLISTENER_TOKEN' ? { visitors: NO_TOKEN_VISITORS } : {}),
+    };
+  }
+  // backup.js names a setting that is set but not usable.
+  match = /^(BACKUP_[A-Z0-9_]+) must be (.+?)\.?$/.exec(text);
+  if (match) return { said: `The setting ${match[1]} is not valid: it must be ${escapeHtml(match[2])}.`, todo: `Correct ${match[1]} in the deployment's settings on Vercel, then redeploy.` };
   match = /no watched section or bill could be read \((.*)\)$/.exec(text);
   if (match) {
     return {
       said: `No watched section or bill could be read from the Senate's Open Legislation API (${escapeHtml(withoutKeys(match[1]))}).`,
-      todo: "If the reason is a refusal (status 401 or 403), check NYSENATE_API_KEY in the deployment's settings on Vercel. Otherwise nothing needs doing.",
+      todo: "If the reason is a refusal (status 401 or 403), check NYSENATE_API_KEY in the deployment's settings on Vercel. Otherwise the Senate's service was likely down: if it fails again tomorrow night, it needs a look.",
+    };
+  }
+  // Postgres names a table or column the code needs that the database lacks; the statute watch says so of its own table.
+  if (/\bdoes not exist\b/.test(text)) return { said: 'The database is missing a table or column the job needs.', todo: 'Run npm run setup-db against the production database (or ask Claude to).' };
+  if (/Run npm run setup-db/.test(text)) {
+    return {
+      said: 'The job could not read or write its table in the database.',
+      todo: 'Run npm run setup-db against the production database (or ask Claude to), as the error below says. If the job fails the same way after that, the database itself could not be reached.',
     };
   }
   return { said: 'It stopped with an error, given at the end of this email.' };
@@ -487,9 +525,9 @@ function plainFailure(error) {
 function courtListenerTodo(status) {
   if (status === 0) return 'Nothing needs doing: CourtListener was slow or down. If it fails the same way again tomorrow night, CourtListener may be down for longer.';
   if (status === 429) return "Nothing needs doing: the token's limits free up on their own. If it happens every night, the jobs ask more than the token allows.";
-  if (status === 401 || status === 403) return "Check COURTLISTENER_TOKEN in the deployment's settings on Vercel: until CourtListener takes it again, every refresh and screen fails.";
+  if (status === 401 || status === 403) return "Check COURTLISTENER_TOKEN in the deployment's settings on Vercel, and do it today: replies use the same token. Until CourtListener takes it again, every refresh and screen fails too.";
   if (status >= 500 && status <= 599) return "Nothing needs doing: the error was on CourtListener's side.";
-  return LOOK_TOMORROW;
+  return FALLBACK_TODO;
 }
 
 const sentence = text => `<p>${text}</p>`;
@@ -511,17 +549,19 @@ export async function reportFailedSteps(job, failed) {
   for (const { step, error } of failed) {
     const plain = plainFailure(error);
     const todo = plain.todo ?? (plain.status !== undefined ? courtListenerTodo(plain.status) : null);
+    const visitors = plain.visitors ?? (plain.status !== undefined ? courtListenerVisitors(plain.status) : null);
     if (nightly) {
       const meaning = NIGHTLY_STEPS[step];
       parts.push(`<h3>${escapeHtml(capitalized(String(step)))}</h3>`, sentence(plain.said),
-        sentence(meaning?.means ?? 'It is one of the nightly steps; see the error at the end of this email.'), sentence(todo ?? meaning?.todo ?? LOOK_TOMORROW));
+        sentence(meaning?.means ?? 'It is one of the nightly steps; see the error at the end of this email.'), sentence(todo ?? meaning?.todo ?? FALLBACK_TODO));
     } else {
-      parts.push(sentence(`${own.opening} ${plain.said}`), sentence(own.visitors), sentence(todo ?? LOOK_TOMORROW));
+      parts.push(sentence(`${own.opening} ${plain.said}`), sentence(visitors ?? own.visitors), sentence(todo ?? FALLBACK_TODO));
     }
   }
   if (own.again) parts.push(sentence(own.again));
+  // The states /health/deep gives a job (deepHealth above).
   const health = `${escapeHtml(APP_URL)}/health/deep`;
-  parts.push(sentence(`To see how each job's last run went, open <a href="${health}">${health}</a>: each job reads "ok" or "failed".`));
+  parts.push(sentence(`To see how each job's last run went, open <a href="${health}">${health}</a>: each job reads "ok", "failed", "late" (no run in the last 26 hours) or "not run yet".`));
   const raw = failed.map(({ step, error }) => `${escapeHtml(step)}: ${escapeHtml(withoutKeys(error))}`).join('; ');
   parts.push(`<p style="color:#666;font-size:12px">For whoever debugs it, the error as the app gave it: ${raw}</p>`);
   const subject = `${SITE}: the ${job} job failed${job === 'nightly' ? ` (${failed.length} step${failed.length === 1 ? '' : 's'})` : ''}`;

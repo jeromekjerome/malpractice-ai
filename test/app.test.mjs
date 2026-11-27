@@ -8977,7 +8977,7 @@ test("the daily summary carries a case library section: counts by type, the type
   assert.ok(full.includes('Case library'));
   assert.ok(full.includes(`<p>Held for your decision: 2. Clear or ban them on the <a href="${process.env.APP_URL}/admin.html">admin page</a>.</p>`), full);
   const empty = Object.keys(CASE_TOPICS).filter(type => !['surgical_error', 'misdiagnosis'].includes(type));
-  assert.ok(full.includes(`</ul><p>No decisions yet: ${empty.join(', ')}.</p><p>Held for your decision`), 'only the types with decisions are listed, then one line for the rest, then the held line');
+  assert.ok(full.includes(`</ul><p>No decisions yet (or only banned ones): ${empty.join(', ')}.</p><p>Held for your decision`), 'only the types with decisions are listed, then one line for the rest, then the held line');
   assert.ok(noAllowance.includes(`<p>Held for your decision: 1. Clear or ban them on the <a href="${process.env.APP_URL}/admin.html">admin page</a>.</p>`), noAllowance);
   assert.ok(noneHeld.includes('<p>Held for your decision: 0.</p>'), noneHeld);
   assert.ok(!noneHeld.includes('Clear or ban them'), 'a link to nothing to decide');
@@ -8988,7 +8988,7 @@ test("the daily summary carries a case library section: counts by type, the type
   const short = Object.keys(CASE_TOPICS).filter(type => type !== 'surgical_error').join(', ');
   assert.ok(full.includes(`<p>Types with fewer than 5 clear decisions: ${short}.</p>`), full);
   assert.ok(full.includes('<p>CourtListener requests yesterday (New York day): chat-search 4, gate-lookup 2, library 10.</p>'
-    + '<p>Topics set aside last night with no answer from CourtListener: surgical-error-wrong-site and misdiagnosis-radiology. They are first in line at the next refresh.</p>'), full);
+    + '<p>Topics set aside last night with no answer from CourtListener: surgical-error-wrong-site and misdiagnosis-radiology. They keep their place in line, ahead of the topics searched since.</p>'), full);
   assert.doesNotMatch(noAllowance, /set aside/, 'a last run that cannot be read leaves the line out');
   assert.doesNotMatch(noneHeld, /set aside/, 'a run older than last night leaves the line out');
   assert.ok(full.includes('<p>Replies yesterday: 7 from the library, 3 live.</p>'), full);

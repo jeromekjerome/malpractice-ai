@@ -263,11 +263,11 @@ async function caseLibrarySection() {
     const repliesOf = job => usage.find(row => row.job === job)?.requests ?? 0;
     const none = types.filter(type => !hasAny(type));
     return `${types.some(hasAny) ? `<ul>${types.filter(hasAny).map(type => `<li>${escapeHtml(type)}: ${of(type).clear} clear, ${of(type).unscreened} unscreened, ${of(type).held} held</li>`).join('')}</ul>` : ''}` +
-      `${none.length ? `<p>No decisions yet: ${none.map(escapeHtml).join(', ')}.</p>` : ''}` +
+      `${none.length ? `<p>No decisions yet (or only banned ones): ${none.map(escapeHtml).join(', ')}.</p>` : ''}` +
       `<p>Held for your decision: ${counts.held}.${counts.held > 0 ? ` Clear or ban them on the <a href="${escapeHtml(APP_URL)}/admin.html">admin page</a>.` : ''}</p>` +
       `<p>Types with fewer than ${MIN_CLEAR_DECISIONS} clear decisions: ${few.length ? few.map(escapeHtml).join(', ') : 'none'}.</p>` +
       `<p>CourtListener requests yesterday (New York day): ${requests.length ? requests.map(row => `${escapeHtml(row.job)} ${row.requests}`).join(', ') : 'none'}.</p>` +
-      `${setAside?.length ? `<p>Topics set aside last night with no answer from CourtListener: ${listed(setAside.map(escapeHtml))}. They are first in line at the next refresh.</p>` : ''}` +
+      `${setAside?.length ? `<p>Topics set aside last night with no answer from CourtListener: ${listed(setAside.map(escapeHtml))}. They keep their place in line, ahead of the topics searched since.</p>` : ''}` +
       `<p>Replies yesterday: ${repliesOf(REPLIES_FROM_LIBRARY)} from the library, ${repliesOf(REPLIES_LIVE)} live.</p>` +
       `<p>${allowance ? `CourtListener allowance left: ${allowance.day} today, ${allowance.hour} this hour.` : 'The CourtListener allowance left could not be read.'}</p>`;
   } catch (err) {

@@ -303,8 +303,8 @@ async function tellOwner(notify, row, hold, site, extra) {
  *   and the run goes on.
  * At most one decision a run is held as unreadable, whatever the answer was. After it, a decision with no answer only gets
  * its try time, and one with any other answer the screen cannot read gets its try time and the run throws, so a change at
- * CourtListener that every question meets still stops the run. A run in which no request got an answer at all, an outage,
- * throws at its end. Every row written before a throw is kept.
+ * CourtListener that every question meets still stops the run. A run in which a request got no answer and none was answered
+ * (no answer and a 5xx are not answers), an outage, throws at its end. Every row written before a throw is kept.
  *
  * @param {Function} options.search     search({ params }) => { status, body } (searchForScreen in courtlistener.js); never throws
  * @param {Function} options.allowance  () => { day, hour, minute } | null, read once (readAllowance)
@@ -337,7 +337,7 @@ export async function screenDecisions({
   const rows = await dueForScreen(sqlClient, { limit: cap, now: new Date(start) });
 
   // Every request after the first waits the spacing; none is sent when the spacing would carry the run past its time. Each is
-  // counted before it is sent, as CourtListener counts it.
+  // counted before it is sent, as CourtListener counts it. An answer is any status but 0 and a 5xx, CourtListener's own error.
   let answered = 0;
   const ask = async params => {
     if (now() - start + spacingMs > budgetMs) return TIME_UP;
@@ -345,7 +345,8 @@ export async function screenDecisions({
     await countRequests(sqlClient, 'screen', 1);
     result.requests += 1;
     const answer = await search({ params });
-    if (statusOf(answer) !== 0) answered += 1;
+    const status = statusOf(answer);
+    if (status !== 0 && !(status >= 500 && status <= 599)) answered += 1;
     return answer;
   };
 
@@ -396,7 +397,8 @@ export async function screenDecisions({
     result.held += 1;
     if (!(await tellOwner(notify, row, hold, site, { appUrl, marked: found.marked ?? null }))) result.notifyFailed += 1;
   }
-  if (result.requests > 0 && answered === 0) {
+  // A run with a request that got no answer and none answered is an outage. A lone 5xx held as unreadable is not.
+  if (unanswered.length > 0 && answered === 0) {
     throw new Error(`CourtListener answered 0 to every screen request of the run (${unanswered.join(', ')}); the run failed`);
   }
   if (!result.stoppedBecause && rows.length >= cap) result.stoppedBecause = capReason;

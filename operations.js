@@ -484,6 +484,14 @@ function plainFailure(error) {
     const where = { limit: seconds(LIBRARY_TIMEOUT_MS), what: searchFor(match[2]), at: `at ${searchFor(match[2])}` };
     return { said: courtListenerSaid(status, where, 'the refresh'), status };
   }
+  // No answer to some of the screen's requests and CourtListener's own error to the others: none got an answer, and the
+  // decisions that got the error are named apart.
+  match = /CourtListener answered 0 to every other screen request of the run \(([^)]*)\), and (.+); the run failed/.exec(text);
+  if (match) {
+    const errors = [...match[2].matchAll(/(\d+) to the screen of (\d+)/g)]
+      .map(([, status, id]) => `an error of its own (status ${status}) while the screen asked about decision ${id}`);
+    return { said: `None of the screen's requests got an answer: CourtListener gave none within ${seconds(SCREEN_TIMEOUT_MS)} for ${decisions(match[1].split(', '))}, and had ${listed(errors)}.`, status: 0 };
+  }
   match = /CourtListener answered 0 to every screen request of the run \(([^)]*)\)/.exec(text);
   if (match) return { said: `CourtListener gave no answer within ${seconds(SCREEN_TIMEOUT_MS)} to any of the screen's requests (${decisions(match[1].split(', '))}).`, status: 0 };
   match = /CourtListener answered (\d+) to the screen of (\d+); the run stopped/.exec(text);

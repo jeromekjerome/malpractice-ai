@@ -6210,6 +6210,11 @@ test('the screen failure email names the decision, says what CourtListener did m
   const silent = await failureEmail('screen', [{ step: 'screen the case library', error: 'CourtListener answered 0 to every screen request of the run (5685956, 5685957); the run failed' }]);
   assert.ok(silent.html.includes('<p>The nightly screen of the case library failed. CourtListener gave no answer within 45 seconds to any of the screen\'s requests (decisions 5685956 and 5685957).</p>'
     + VISITORS.down), silent.html);
+  // No answer to some requests and CourtListener's own error to another: none got an answer, and the 5xx is named apart.
+  const mixed = await failureEmail('screen', [{ step: 'screen the case library', error: 'CourtListener answered 0 to every other screen request of the run (5685957, 5685958), and 503 to the screen of 5685956; the run failed' }]);
+  assert.ok(mixed.html.includes('<p>The nightly screen of the case library failed. None of the screen\'s requests got an answer: CourtListener gave none within 45 seconds for decisions 5685957 and 5685958, '
+    + 'and had an error of its own (status 503) while the screen asked about decision 5685956.</p>' + VISITORS.down), mixed.html);
+  assert.doesNotMatch(mixed.html, /to any of the screen's requests/);
   const refused = await failureEmail('screen', [{ step: 'screen the case library', error: 'CourtListener answered 401 to the screen of 5685956; the run stopped' }]);
   assert.ok(refused.html.includes(VISITORS.refused), refused.html);
   const missing = await failureEmail('screen', [{ step: 'screen the case library', error: 'COURTLISTENER_TOKEN is not set in this deployment' }]);

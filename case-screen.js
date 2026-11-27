@@ -352,8 +352,10 @@ export async function screenDecisions({
 
   // Whether a decision has been held as unreadable in this run: one may be, whatever the answer was.
   let unreadableHeld = false;
-  // The decisions that got no answer, for the error of a run in which none did.
+  // The decisions that got no answer, and those that got CourtListener's own error (a 5xx), for the error of a run in which
+  // no request was answered.
   const unanswered = [];
+  const ownErrors = [];
   for (const row of rows) {
     const questions = screenQuestions(row);
     // A decision is started only when all its questions fit under the cap.
@@ -374,6 +376,7 @@ export async function screenDecisions({
     // goes on.
     const unreadable = found.failed ?? found.unreadable;
     if (found.failed === 0) unanswered.push(row.cluster_id);
+    else if (found.failed !== undefined) ownErrors.push({ id: row.cluster_id, status: found.failed });
     if (unreadable !== undefined) {
       if (found.failed === 0 && (!row.last_try_failed || unreadableHeld)) {
         await recordTried(sqlClient, row.cluster_id, at);
@@ -397,8 +400,13 @@ export async function screenDecisions({
     result.held += 1;
     if (!(await tellOwner(notify, row, hold, site, { appUrl, marked: found.marked ?? null }))) result.notifyFailed += 1;
   }
-  // A run with a request that got no answer and none answered is an outage. A lone 5xx held as unreadable is not.
+  // A run with a request that got no answer and none answered is an outage. A lone 5xx held as unreadable is not. The error
+  // names apart the decisions that got CourtListener's own error, so that it never says they got no answer.
   if (unanswered.length > 0 && answered === 0) {
+    if (ownErrors.length) {
+      throw new Error(`CourtListener answered 0 to every other screen request of the run (${unanswered.join(', ')}), and `
+        + `${ownErrors.map(({ id, status }) => `${status} to the screen of ${id}`).join(', ')}; the run failed`);
+    }
     throw new Error(`CourtListener answered 0 to every screen request of the run (${unanswered.join(', ')}); the run failed`);
   }
   if (!result.stoppedBecause && rows.length >= cap) result.stoppedBecause = capReason;

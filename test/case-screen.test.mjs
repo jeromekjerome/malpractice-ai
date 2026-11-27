@@ -647,7 +647,8 @@ test('a 5xx is no answer from CourtListener either: a run whose other requests g
   const db = fakeLibrary([fresh, repeat]);
   const { search } = answering(db, params => (params.q.includes(`(${repeat.opinion_id})`) ? { status: 503, body: null } : { status: 0, body: null }));
   const mail = fakeMail();
-  await rejectsQuietly(run({ db, search, mail }), new RegExp(`^Error: CourtListener answered 0 to every screen request of the run \\(${fresh.cluster_id}\\); the run failed$`));
+  // The error names the decision that got CourtListener's own error apart from those that got no answer.
+  await rejectsQuietly(run({ db, search, mail }), new RegExp(`^Error: CourtListener answered 0 to every other screen request of the run \\(${fresh.cluster_id}\\), and 503 to the screen of ${repeat.cluster_id}; the run failed$`));
   assert.deepEqual([db.row(fresh.cluster_id).screen_state, db.row(repeat.cluster_id).screen_state], ['unscreened', 'held']);
   assert.equal(mail.sent.length, 1, 'the hold was emailed before the run failed');
   // A run whose one request is a 5xx on a decision whose last try failed holds it and ends well, as before.

@@ -27,7 +27,7 @@ const COMMANDS = {
   check: 'compare what is kept with the Senate\'s text',
   report: 'print each source with the notes and places that rest on it',
   approve: 'approve a change the check found',
-  reviewed: 'record that a source kept by hand has been reviewed',
+  reviewed: 'record that sources kept by hand have been reviewed (one or several ids), or opinions on the State Bar\'s list',
 };
 
 function usage(out) {
@@ -373,11 +373,12 @@ async function approve(args, { readSource, lawUrl, statutesDir, now, out, err })
   return 0;
 }
 
-// Renews the review date of a source the API cannot serve, which the owner reads by hand; or, for the State Bar's list, marks
-// the opinions the owner has read. Nothing is written until every argument has been checked.
+// Renews the review date of the sources the API cannot serve, which the owner reads by hand, one or several at once; or, for
+// the State Bar's list, marks the opinions the owner has read. Nothing is written until every argument has been checked.
 function reviewed(args, { lawUrl, now, out, err }) {
   const [id, ...numbers] = args;
-  const usage = 'Usage: node law.mjs reviewed <id> [numbers...]   (numbers are required for the State Bar\'s list, e.g. 1310 1311)';
+  const usage = 'Usage: node law.mjs reviewed <id> [more ids...]   for sources kept by hand, or node law.mjs reviewed <id> <numbers...>   '
+    + 'for the State Bar\'s list (numbers are required, e.g. 1310 1311)';
   if (!id) {
     err(usage);
     return 2;
@@ -399,18 +400,36 @@ function reviewed(args, { lawUrl, now, out, err }) {
     out(`Marked opinions ${[...new Set(numbers.map(Number))].sort((a, b) => a - b).join(', ')} of ${id} as reviewed; reviewed_on is ${source.reviewed_on}. Commit the notes file and push it; the watch reads the deployed copy.`);
     return 0;
   }
-  if (numbers.length) {
-    err(usage);
-    err(`${id} takes no numbers.`);
-    return 2;
-  }
   if (source.kind !== 'by_hand') {
+    if (numbers.length) {
+      err(usage);
+      err(`${id} takes no numbers.`);
+      return 2;
+    }
     err(`${id} is read from the Senate, so it is approved, not reviewed. Use: npm run law:approve -- ${id} <fingerprint>`);
     return 1;
   }
-  source.reviewed_on = todayInNewYork(now);
+  // Several sources kept by hand: each is checked before any is written, so either every one is recorded or none is.
+  const ids = [...new Set([id, ...numbers])];
+  const sources = ids.map(other => listOf(law.sources).find(candidate => candidate?.id === other && SOURCE_ID.test(other)));
+  const problems = ids.map((other, index) => {
+    const found = sources[index];
+    if (!found) return `${other} is not a source in the notes file.`;
+    if (found.kind === 'listing') return `${other} is the State Bar's list: mark its opinions reviewed on their own, with npm run law:reviewed -- ${other} <numbers>.`;
+    if (found.kind !== 'by_hand') return `${other} is read from the Senate, so it is approved, not reviewed. Use: npm run law:approve -- ${other} <fingerprint>`;
+    return null;
+  }).filter(Boolean);
+  if (problems.length) {
+    err(usage);
+    for (const problem of problems) err(problem);
+    err('Nothing was written.');
+    return 2;
+  }
+  const today = todayInNewYork(now);
+  for (const each of sources) each.reviewed_on = today;
   writeLawFile(lawUrl, law);
-  out(`Set reviewed_on of ${id} to ${source.reviewed_on}. Commit the notes file and push it; the watch reads the deployed copy.`);
+  const named = ids.length > 1 ? `${ids.slice(0, -1).join(', ')} and ${ids.at(-1)}` : ids[0];
+  out(`Set reviewed_on of ${named} to ${today}. Commit the notes file and push it; the watch reads the deployed copy.`);
   return 0;
 }
 

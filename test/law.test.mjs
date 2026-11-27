@@ -519,6 +519,57 @@ test('law reviewed renews a by-hand source and refuses any other', async () => {
   }
 });
 
+// The approval world with three sources kept by hand.
+function byHandWorld(dir) {
+  const world = approvalWorld(dir);
+  world.law.sources.push(
+    { id: 'NYCAC-7-201', kind: 'by_hand', name: 'NYC Administrative Code § 7-201', url: 'https://example.test/7-201', reviewed_on: null },
+    { id: 'NYCAC-7-210', kind: 'by_hand', name: 'NYC Administrative Code § 7-210', url: 'https://example.test/7-210', reviewed_on: null },
+  );
+  writeFileSync(world.file, formatLawFile(world.law));
+  return world;
+}
+
+test('law reviewed renews several by-hand sources in one command, each once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'law-by-hand-'));
+  try {
+    const { law, file, deps } = byHandWorld(dir);
+    const io = collecting();
+    assert.equal(await main(['reviewed', 'NYCAC-7-201', 'NYCRR-1', 'NYCAC-7-210', 'NYCAC-7-201'], { ...io, ...deps }), 0, io.lines.join('\n'));
+    const expected = structuredClone(law);
+    for (const source of expected.sources.filter(candidate => candidate.kind === 'by_hand')) source.reviewed_on = '2026-11-22';
+    assert.equal(readFileSync(file, 'utf8'), formatLawFile(expected));
+    const said = io.lines.join('\n');
+    assert.ok(said.includes('Set reviewed_on of NYCAC-7-201, NYCRR-1 and NYCAC-7-210 to 2026-11-22. Commit the notes file and push it; the watch reads the deployed copy.'), said);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('law reviewed with several ids writes none of them when any is unknown or not kept by hand, and exits 2 with the reason', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'law-by-hand-'));
+  try {
+    const { file, deps } = byHandWorld(dir);
+    const before = readFileSync(file, 'utf8');
+    const cases = [
+      [['reviewed', 'NYCAC-7-201', 'NYCAC-9-999'], /NYCAC-9-999 is not a source in the notes file/],
+      [['reviewed', 'NYCAC-7-201', 'CPLR-214'], /CPLR-214 is read from the Senate, so it is approved, not reviewed/],
+      [['reviewed', 'NYCAC-7-201', 'NYCAC-7-210', 'BILL-2025-S1'], /BILL-2025-S1 is read from the Senate/],
+    ];
+    for (const [argv, reason] of cases) {
+      const io = collecting();
+      assert.equal(await main(argv, { ...io, ...deps }), 2, JSON.stringify(argv));
+      const said = io.lines.join('\n');
+      assert.match(said, reason);
+      assert.match(said, /Nothing was written\./);
+      assert.match(said, /Usage/);
+      assert.equal(readFileSync(file, 'utf8'), before, JSON.stringify(argv));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('law approve prints the notes and places to edit if the rule changed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'law-approve-'));
   try {

@@ -8411,6 +8411,8 @@ function screenWorld({ searchStatus = 200, results = [] } = {}) {
     if (url.startsWith('https://www.courtlistener.com/')) {
       world.courtListener.push(url);
       if (url.includes('/api-usage/')) return jsonResponse(CL_USAGE_REPORT);
+      // Status 0 is a search that never answers: the connection fails.
+      if (url.includes('/search/') && searchStatus === 0) throw new TypeError('fetch failed');
       if (url.includes('/search/')) return searchStatus === 200 ? jsonResponse({ count: results.length, results }) : jsonResponse({ detail: 'Request was throttled.' }, searchStatus);
       throw new Error(`Unexpected CourtListener request in test: ${url}`);
     }
@@ -8487,7 +8489,9 @@ test('a decision the screen holds is emailed to the owner, naming the site and t
       assert.equal(JSON.parse(held.params[2]).later.case_name, 'Later v. Case');
       assert.equal(sent.length, 1);
       assert.ok(sent[0].subject.startsWith('NYCMalpractice.ai: ') && sent[0].subject.includes('Licari v. Elliott'), sent[0].subject);
-      assert.ok(sent[0].html.includes('a made-up passage: the objection was overruled'), sent[0].html);
+      const bold = word => `<strong style="background:#fff3a3">${word}</strong>`;
+      assert.ok(sent[0].html.includes(`a made-up passage: the ${bold('objection')} was ${bold('overruled')}`), sent[0].html);
+      assert.ok(sent[0].html.includes(`It waits for you on the <a href="${process.env.APP_URL}/admin.html">admin page</a>`), 'the admin page is a link built from APP_URL');
     })));
   } finally {
     await server.close();

@@ -62,6 +62,10 @@ export function partyWords(caseName) {
   return sides ? [wordOf(sides[1]), wordOf(sides[2])] : [wordOf(name), null];
 }
 
+// A case name as the higher court question searches it when it gives no party word: its letters and spaces, at most
+// PHRASE_LIMIT characters.
+const captionPhrase = caseName => String(caseName ?? '').replace(/[^\p{L}\s]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, PHRASE_LIMIT).trim();
+
 // The questions for one decision: { citing, higherCourt }, each the search's parameters; higherCourt is null for a decision
 // of the Court of Appeals. Neither carries a date from the owner's decision: a re-screen skips the clusters the decision's
 // hold lists as seen instead (screenOne).
@@ -73,7 +77,7 @@ export function screenQuestions(row) {
   if (row.court_id === 'ny') return { citing, higherCourt: null };
 
   const words = [one, two].filter(Boolean);
-  const phrase = String(row.case_name ?? '').replace(/[^\p{L}\s]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, PHRASE_LIMIT).trim();
+  const phrase = captionPhrase(row.case_name);
   const higherCourt = {
     type: 'o', q: `caseName:${words.length ? `(${words.join(' AND ')})` : `("${phrase}")`}`,
     court: row.court_id === 'nyappdiv' ? 'ny' : 'nyappdiv ny', order_by: 'dateFiled desc',
@@ -121,6 +125,15 @@ const snippetOf = hit => String(hit?.opinions?.[0]?.snippet ?? hit?.snippet ?? '
 // The hit's highlighted passage as plain text: the marks removed, and a tag cut off at the end of the snippet too.
 const passageOf = hit => plainText(snippetOf(hit).replace(/<[^>]*$/, '')).slice(0, PASSAGE_LIMIT);
 const hasMark = hit => /<mark>/i.test(snippetOf(hit));
+// The same passage for the owner's email, with CourtListener's marks kept as two private characters that no escaping touches,
+// or null when no mark is left in it. The stored hold keeps the plain passage: the admin page shows it as text.
+const MARK_OPEN = '';
+const MARK_CLOSE = '';
+function markedPassageOf(hit) {
+  const snippet = snippetOf(hit).replace(/[]/g, '').replace(/<[^>]*$/, '');
+  const text = plainText(snippet.replace(/<mark>/gi, MARK_OPEN).replace(/<\/mark>/gi, MARK_CLOSE)).slice(0, PASSAGE_LIMIT);
+  return text.includes(MARK_OPEN) ? text : null;
+}
 
 // What an answer is:
 // - refused: 401, 403 or 429, CourtListener refusing the token or the rate, never the decision's doing;
@@ -138,7 +151,8 @@ function readAnswer(answer) {
 }
 
 // Asks a decision's questions in turn. Returns TIME_UP when the time ran out before a question, { refused }, { failed } or
-// { unreadable } with the status, { hold } for the first question that found something, or {} for nothing found. A hit is a
+// { unreadable } with the status, { hold, marked } for the first question that found something (`marked` is the passage with
+// its marks for the email, or null), or {} for nothing found. A hit is a
 // result that is neither the decision itself nor a cluster the row's last hold lists as seen on that question. The owner is
 // shown, for the citing question, the first hit with a marked passage, else its first hit; for the higher court question, its
 // first hit. The hold counts the hits, which are of the answer's first page alone, and records `more: true` when CourtListener
@@ -164,6 +178,7 @@ async function screenOne(row, questions, ask) {
         question, later: laterOf(shown), passage: passageOf(shown), hits: hits.length, ...(read.more ? { more: true } : {}),
         seen: { ...seen, [question]: seenWith(seen[question], found) },
       },
+      marked: question === 'citing' ? markedPassageOf(shown) : null,
     };
   }
   return {};
@@ -188,28 +203,83 @@ function foundCount(hits, more) {
   return hits === 1 ? '1 later decision was found. It is shown below.' : `${hits} later decisions were found. The first is shown below.`;
 }
 
-// The owner's email about one held decision: the decision, the count of later decisions found, the one shown and its passage,
-// every value escaped. An unreadable hold is screened again from the admin page (decideHeld in case-library.js), not cleared.
-function holdEmail(row, hold, site) {
+// What each choice on the admin page does (decideHeld in case-library.js). A hold that answered no question is screened again,
+// not cleared.
+const CHOICES = {
+  clear: '<li><strong>Clear</strong>: it goes back into the library and may be offered to replies again. The screen looks at it again in 30 days, passing over the later decisions it found this time.</li>',
+  again: '<li><strong>Screen again</strong>: it goes back in line, and the next run of the screen asks CourtListener about it again.</li>',
+  ban: '<li><strong>Ban</strong>: it is never offered to replies and never screened again.</li>',
+};
+const SAFE_DEFAULT = '<p>If you are not sure, leave it held. That is the safe default: a held decision is never offered to replies.</p>';
+const BOLD = '<strong style="background:#fff3a3">';
+
+// Words in quotes, joined as a reader lists them: "A", "B" and "C".
+const quoted = (words, joiner) => {
+  const list = words.map(word => `"${escapeHtml(word)}"`);
+  return list.length > 1 ? `${list.slice(0, -1).join(', ')} ${joiner} ${list.at(-1)}` : list[0] ?? '';
+};
+const ANY_TREATMENT_WORDS = ['overruled', 'abrogated', 'superseded'];
+
+// The passage with the words CourtListener marked in bold, escaped everywhere else. A mark the passage's cut left open is closed.
+function markedHtml(text) {
+  let open = false;
+  const html = escapeHtml(text).replace(/[]/g, mark => {
+    if (mark === MARK_OPEN && !open) { open = true; return BOLD; }
+    if (mark === MARK_CLOSE && open) { open = false; return '</strong>'; }
+    return '';
+  });
+  return open ? `${html}</strong>` : html;
+}
+
+// The question that found the later decision and the words to search it for, for a hold whose passage shows no match: a
+// citing hold whose hits carry no mark, or a higher court hold, whose question asks for no marks.
+function whatToLookFor(row, question) {
+  const [one, two] = partyWords(row.case_name);
+  if (question === 'citing') {
+    const party = one ?? two;
+    const near = party ? `within ${DISTANCE} words of "${escapeHtml(party)}"` : 'in it';
+    const search = party
+      ? `search it for "${escapeHtml(party)}", then read what it says near each place the name appears`
+      : `search it for ${quoted(ANY_TREATMENT_WORDS, 'and')}`;
+    return `<h3>What to look for</h3><p>The question that found it: does a later decision that cites this one have a word such as ${quoted(ANY_TREATMENT_WORDS, 'or')} ${near}? `
+      + `CourtListener's passage from the later decision does not show where, so open it and ${search}.</p>`;
+  }
+  const words = [one, two].filter(Boolean);
+  return '<h3>What to look for</h3><p>The question that found it: has a higher court since decided a case under the same party names? The later decision\'s name has them. '
+    + `Open it and search it for ${quoted(words.length ? words : [captionPhrase(row.case_name)], 'and')} to see whether it is this case on appeal or another case between the same parties.</p>`;
+}
+
+// The owner's email about one held decision: what the screen found, what clearing and banning do, the decision, the count of
+// later decisions found, the one shown, and its passage with the words the search found in bold, or, when it shows none of
+// them, the question and the words to search the later decision for. Every value is escaped. The admin page is a link when
+// the site's address is given.
+function holdEmail(row, hold, site, { appUrl = '', marked = null } = {}) {
   const citations = Array.isArray(row.citations) ? row.citations : [];
   const lines = values => values.filter(Boolean).join('<br>');
-  const choices = hold.question === 'unreadable' ? 'screen it again or ban it' : 'clear it or ban it';
+  const unreadable = hold.question === 'unreadable';
+  const address = String(appUrl ?? '').replace(/\/+$/, '');
+  const adminPage = /^https?:\/\//i.test(address) ? `<a href="${escapeHtml(address)}/admin.html">admin page</a>` : 'admin page';
   const parts = [
     `<p>The nightly screen held a court decision in the case library. ${escapeHtml(FINDINGS[hold.question](hold))}`
-      + ` While it is held it is not offered to replies. It waits for you on the admin page, where you can ${choices}.</p>`,
+      + ' While it is held it is not offered to replies.</p>',
+    `<p>It waits for you on the ${adminPage}, where you can ${unreadable ? 'screen it again or ban it' : 'clear it or ban it'}:</p>`,
+    `<ul>${unreadable ? CHOICES.again : CHOICES.clear}${CHOICES.ban}</ul>`,
+    SAFE_DEFAULT,
     `<h3>The decision</h3><p>${lines([escapeHtml(row.case_name), escapeHtml(citations[0]), escapeHtml([row.court, row.date_filed].filter(Boolean).join(', ')), linkOf(row.url)])}</p>`,
   ];
   if (hold.later) {
     if (Number.isInteger(hold.hits) && hold.hits > 0) parts.push(`<p>${foundCount(hold.hits, hold.more === true)}</p>`);
     parts.push(`<h3>The later decision</h3><p>${lines([escapeHtml(hold.later.case_name), escapeHtml([hold.later.court, hold.later.date_filed].filter(Boolean).join(', ')), linkOf(hold.later.url)])}</p>`);
+    parts.push(hold.question === 'citing' && marked
+      ? `<h3>The passage</h3><p>From the later decision, with the words the search found in bold:</p><blockquote>${markedHtml(marked)}</blockquote>`
+      : whatToLookFor(row, hold.question));
   }
-  if (hold.passage) parts.push(`<h3>The passage</h3><blockquote>${escapeHtml(hold.passage)}</blockquote>`);
   return { subject: `${site ? `${site}: ` : ''}A decision is held for your review: ${row.case_name}`, html: parts.join('') };
 }
 
 // Emails the owner about a decision newly held. Returns whether the email went; one that did not is logged, never retried.
-async function tellOwner(notify, row, hold, site) {
-  const { subject, html } = holdEmail(row, hold, site);
+async function tellOwner(notify, row, hold, site, extra) {
+  const { subject, html } = holdEmail(row, hold, site, extra);
   let outcome;
   try {
     outcome = await notify(subject, html);
@@ -239,11 +309,12 @@ async function tellOwner(notify, row, hold, site) {
  * @param {Function} options.search     search({ params }) => { status, body } (searchForScreen in courtlistener.js); never throws
  * @param {Function} options.allowance  () => { day, hour, minute } | null, read once (readAllowance)
  * @param {Function} options.notify     notify(subject, html) => { sent: true } | { sent: false, reason } (sendOperatorNotice)
+ * @param {string}   [options.appUrl]   the site's address, for the link to the admin page in the email; without it the page is named only
  * @param {Function} options.now        the time in milliseconds
  * @returns {Promise<{ screened: number, cleared: number, held: number, requests: number, notifyFailed: number, stoppedBecause: null | 'allowance' | 'time' }>}
  */
 export async function screenDecisions({
-  sqlClient, search, allowance, notify, site = '', now = Date.now, sleep = wait,
+  sqlClient, search, allowance, notify, site = '', appUrl = '', now = Date.now, sleep = wait,
   // The budget goes with searchForScreen's 45 s timeout (courtlistener.js): the last request starts by 235 s and so ends by
   // 280 s, inside the 300 s of the jobs function (api/jobs.js). Change the two together.
   maxRequests = 20, spacingMs = 13000, budgetMs = 235000, reserve = 30, hourReserve = 5,
@@ -323,7 +394,7 @@ export async function screenDecisions({
     const hold = { found_at: at, ...found.hold };
     if (!(await recordHeld(sqlClient, row.cluster_id, hold, at))) continue;
     result.held += 1;
-    if (!(await tellOwner(notify, row, hold, site))) result.notifyFailed += 1;
+    if (!(await tellOwner(notify, row, hold, site, { appUrl, marked: found.marked ?? null }))) result.notifyFailed += 1;
   }
   if (result.requests > 0 && answered === 0) {
     throw new Error(`CourtListener answered 0 to every screen request of the run (${unanswered.join(', ')}); the run failed`);

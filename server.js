@@ -1326,7 +1326,7 @@ function screenCaseLibrary() {
   const token = process.env.COURTLISTENER_TOKEN;
   if (!token) throw new Error('COURTLISTENER_TOKEN is not set in this deployment');
   return screenDecisions({
-    sqlClient: sql, search: searchForScreen, allowance: () => readAllowance({ token }), notify: sendOperatorNotice, site: SITE_NAME,
+    sqlClient: sql, search: searchForScreen, allowance: () => readAllowance({ token }), notify: sendOperatorNotice, site: SITE_NAME, appUrl: APP_URL,
     maxRequests: numberSetting('SCREEN_REQUESTS_PER_RUN', 20), reserve: numberSetting('COURTLISTENER_RESERVE', 30),
   });
 }

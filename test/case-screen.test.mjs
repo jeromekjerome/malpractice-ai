@@ -121,7 +121,7 @@ async function run({ db, search, mail = fakeMail(), clock = fakeClock(), ...over
   console.log = console.warn = console.error = (...parts) => logs.push(parts.join(' '));
   try {
     const result = await screenDecisions({
-      sqlClient: db.sql, search, allowance: async () => PLENTY, notify: mail.notify, site: 'nycinjury.ai', now: clock.now, sleep: clock.sleep, ...overrides,
+      sqlClient: db.sql, search, allowance: async () => PLENTY, notify: mail.notify, site: 'nycinjury.ai', appUrl: 'https://nycinjury.ai', now: clock.now, sleep: clock.sleep, ...overrides,
     });
     return { result, logs, mail, clock };
   } finally {
@@ -151,6 +151,9 @@ const decision = (extra = {}) => {
 };
 const courtOfAppeals = (extra = {}) => decision({ court: 'New York Court of Appeals', court_id: 'ny', ...extra });
 const plainSnippet = result => result.opinions[0].snippet.replace(/<[^>]+>/g, '');
+// A word the email shows in bold as one the search found, and the email's line on leaving a decision held.
+const bold = word => `<strong style="background:#fff3a3">${word}</strong>`;
+const SAFE_DEFAULT = '<p>If you are not sure, leave it held. That is the safe default: a held decision is never offered to replies.</p>';
 const ago = days => new Date(NIGHT - days * DAY_MS).toISOString();
 
 test('on the recorded answers, the three recorded to hold are held and the three recorded to clear are cleared', async () => {
@@ -748,14 +751,78 @@ test('the email about an unreadable hold says the owner can screen it again or b
     const { mail } = await run({ db, search: answering(db, params => (params.q.includes(`(${repeat.opinion_id})`) ? { status, body: null } : { status: 200, body: { count: 0, results: [] } })).search });
     const { html } = mail.sent[0];
     assert.ok(html.includes(`The screen could not read CourtListener's answer for it ${said}.`), html);
-    assert.ok(html.includes('It waits for you on the admin page, where you can screen it again or ban it.</p>'), html);
-    assert.doesNotMatch(html, /status 0|clear it or ban it/);
+    assert.ok(html.includes('<p>It waits for you on the <a href="https://nycinjury.ai/admin.html">admin page</a>, where you can screen it again or ban it:</p>'), html);
+    assert.ok(html.includes('<li><strong>Screen again</strong>: it goes back in line, and the next run of the screen asks CourtListener about it again.</li>'), html);
+    assert.ok(html.includes('<li><strong>Ban</strong>: it is never offered to replies and never screened again.</li>'), html);
+    assert.ok(html.includes(SAFE_DEFAULT), html);
+    assert.doesNotMatch(html, /status 0|clear it or ban it|What to look for|The passage/);
   }
   // A hold that found a later decision is still one to clear or ban.
   const row = courtOfAppeals();
   const db = fakeLibrary([row]);
   const { mail } = await run({ db, search: answering(db, () => ({ status: 200, body: { count: 1, results: [hitOf(850)] } })).search });
-  assert.ok(mail.sent[0].html.includes('It waits for you on the admin page, where you can clear it or ban it.</p>'), mail.sent[0].html);
+  const { html } = mail.sent[0];
+  assert.ok(html.includes('<p>It waits for you on the <a href="https://nycinjury.ai/admin.html">admin page</a>, where you can clear it or ban it:</p>'), html);
+  assert.ok(html.includes('<li><strong>Clear</strong>: it goes back into the library and may be offered to replies again. The screen looks at it again in 30 days, passing over the later decisions it found this time.</li>'), html);
+  assert.ok(html.includes('<li><strong>Ban</strong>: it is never offered to replies and never screened again.</li>'), html);
+  assert.ok(html.includes(SAFE_DEFAULT), html);
+});
+
+test('without the site\'s address the email names the admin page with no link', async () => {
+  const row = courtOfAppeals();
+  const db = fakeLibrary([row]);
+  const { mail } = await run({ db, search: answering(db, () => ({ status: 200, body: { count: 1, results: [hitOf(851)] } })).search, appUrl: '' });
+  assert.ok(mail.sent[0].html.includes('<p>It waits for you on the admin page, where you can clear it or ban it:</p>'), mail.sent[0].html);
+  assert.doesNotMatch(mail.sent[0].html, /admin\.html/);
+});
+
+test('a citing hold with a marked passage shows it with the words the search found in bold', async () => {
+  const row = courtOfAppeals({ case_name: 'Campo v. Scofield' });
+  const db = fakeLibrary([row]);
+  const later = hitOf(852, { opinions: [{ snippet: 'examples see. The <mark>Campo</mark> case was <mark>overruled</mark> in Micallef v Miehle Co. (39 NY2d 376' }] });
+  const { mail } = await run({ db, search: answering(db, () => ({ status: 200, body: { count: 1, results: [later] } })).search });
+  const { html } = mail.sent[0];
+  assert.ok(html.includes(`<h3>The passage</h3><p>From the later decision, with the words the search found in bold:</p><blockquote>examples see. The ${bold('Campo')} case was ${bold('overruled')} in Micallef v Miehle Co. (39 NY2d 376</blockquote>`), html);
+  assert.doesNotMatch(html, /What to look for/);
+  assert.equal(db.row(row.cluster_id).hold.passage, 'examples see. The Campo case was overruled in Micallef v Miehle Co. (39 NY2d 376', 'the stored passage stays plain');
+});
+
+test('a citing hold whose passage shows no match names the question and the word to search the later decision for', async () => {
+  const row = courtOfAppeals({ case_name: 'Amabile v. City of Buffalo' });
+  const db = fakeLibrary([row]);
+  const later = hitOf(853, { opinions: [{ snippet: 'OPINION OF THE COURT. Appeal from an order of the Supreme Court' }] });
+  const { mail } = await run({ db, search: answering(db, () => ({ status: 200, body: { count: 1, results: [later] } })).search });
+  const { html } = mail.sent[0];
+  assert.ok(html.includes('<h3>What to look for</h3><p>The question that found it: does a later decision that cites this one have a word such as "overruled", "abrogated" or "superseded" within 15 words of "Amabile"? '
+    + 'CourtListener\'s passage from the later decision does not show where, so open it and search it for "Amabile", then read what it says near each place the name appears.</p>'), html);
+  assert.doesNotMatch(html, /The passage|OPINION OF THE COURT/, 'the opening of the later decision is not shown as if it held the match');
+  // With no party word in the name, the words to search for are the treatment words themselves.
+  const nameless = courtOfAppeals({ case_name: 'Ng v. Xu' });
+  const db2 = fakeLibrary([nameless]);
+  const { mail: mail2 } = await run({ db: db2, search: answering(db2, () => ({ status: 200, body: { count: 1, results: [hitOf(854, { opinions: [{ snippet: 'no mark' }] })] } })).search });
+  assert.ok(mail2.sent[0].html.includes('does a later decision that cites this one have a word such as "overruled", "abrogated" or "superseded" in it? '
+    + 'CourtListener\'s passage from the later decision does not show where, so open it and search it for "overruled", "abrogated" and "superseded".</p>'), mail2.sent[0].html);
+});
+
+test('a higher court hold names the question and the party words to search the later decision for, and shows no passage', async () => {
+  const row = decision({ case_name: 'Bello v. Masters Auto Collision of Long Is., Inc.' });
+  const db = fakeLibrary([row]);
+  const later = { cluster_id: 855, absolute_url: '/opinion/855/bello-v-masters/', caseName: 'Bello v. Masters Auto Collision', court_id: 'ny', dateFiled: '2024-01-01', opinions: [{ snippet: '18 N.Y.3d 208 (2011) JOSEPH BELLO, Appellant' }] };
+  const { mail } = await run({ db, search: answering(db, params => (params.q.startsWith('caseName:') ? { status: 200, body: { count: 1, results: [later] } } : { status: 200, body: { count: 0, results: [] } })).search });
+  const { html } = mail.sent[0];
+  assert.ok(html.includes('<h3>What to look for</h3><p>The question that found it: has a higher court since decided a case under the same party names? The later decision\'s name has them. '
+    + 'Open it and search it for "Bello" and "Masters" to see whether it is this case on appeal or another case between the same parties.</p>'), html);
+  assert.doesNotMatch(html, /The passage|JOSEPH BELLO/);
+});
+
+test('on the recorded answers, the citing emails show the marked passage and the higher court email says what to look for', async () => {
+  const db = fakeLibrary(Object.values(SIX));
+  const { mail } = await run({ db, search: recorded(db, ...ALL_ANSWERS).search });
+  const [mitchell, campo, perl] = mail.sent.map(sent => sent.html);
+  assert.ok(mitchell.includes(`Comstock, 257 NY at 239; ${bold('Mitchell')} v Rochester Ry. Co., 151 NY 107, 110 [1896], ${bold('overruled')} by Battalla v State`), mitchell);
+  assert.ok(campo.includes(`The ${bold('Campo')} case was ${bold('overruled')} in Micallef v Miehle Co.`), campo);
+  assert.ok(perl.includes('search it for "Perl" and "Meher"'), perl);
+  assert.doesNotMatch(perl, /The passage/);
 });
 
 test('one email for each decision newly held, and a second run sends none', async () => {
@@ -828,7 +895,7 @@ test("the email shows the decision, the later decision and the passage, escaped,
   assert.ok(!/href="javascript:/.test(html), 'an address that is not https is never a link');
   assert.ok(html.includes('<a href="https://www.courtlistener.com/opinion/4244/later-v-three/">'), html);
   assert.ok(html.includes('Later &quot;v.&quot; Three') && html.includes('2024-05-06'), html);
-  assert.ok(html.includes('the Smith rule &amp; its overruled x'), html);
+  assert.ok(html.includes(`the ${bold('Smith')} rule &amp; its ${bold('overruled')} x`), html);
   assert.match(html, /admin page/);
   assert.doesNotMatch(`${subject} ${html}`, /good law/i);
 });

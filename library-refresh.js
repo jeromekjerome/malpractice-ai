@@ -99,14 +99,21 @@ async function resolvePins({ sqlClient, unresolved, lookupPins }) {
   return savePinned(sqlClient, records);
 }
 
-// One night's refresh. Returns what it did; throws when CourtListener answers a topic search with anything but a result,
-// leaving the rows already written and that topic's last-run time untouched.
+// One night's refresh. Returns what it did. A topic search with no answer (status 0: no answer within the time limit, or a
+// network error) is tried once more in the same run, in the last search the run has room for: room counted by the searches
+// the run may send and by the requests the time left allows at the spacing. A topic with no answer on both tries, or with no
+// room left for its second try, is set aside: its last-run time is untouched, so it is first in line the next night. The
+// result names the topics set aside (`noAnswer`) and the topics tried twice (`retried`).
+// It throws, leaving the rows already written and that topic's last-run time untouched:
+// - at once, when CourtListener answers a topic search with any other status but a result (a refusal such as 401, 403 or
+//   429, or a 5xx);
+// - at the end, when no search of the run got an answer at all, an outage; no stale row is dropped that night.
 export async function refreshLibrary({
   sqlClient, topics, search, lookupPins, pins = [], allowance, now = Date.now, sleep = wait,
   maxSearches = 10, perTopic = 8, spacingMs = 13000, budgetMs = 240000, reserve = 30, hourReserve = 5,
 } = {}) {
   const start = now();
-  const result = { searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: null };
+  const result = { searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: null, noAnswer: [], retried: [] };
 
   const answer = await allowance();
   const left = answer ? allowanceLeft(answer, { reserve, hourReserve }) : 0;
@@ -132,13 +139,32 @@ export async function refreshLibrary({
   }
 
   const cap = Math.min(maxSearches, left - sent);
-  const queue = result.stoppedBecause === 'time' ? [] : inRunOrder(topics, await lastRunsOf(sqlClient));
-  for (const topic of queue) {
-    if (result.searched.length >= maxSearches) break;
-    if (result.searched.length >= cap) { if (cap < maxSearches) result.stoppedBecause = 'allowance'; break; }
+  const firstTries = result.stoppedBecause === 'time' ? [] : inRunOrder(topics, await lastRunsOf(sqlClient));
+  // The topics that got no answer, waiting for their second try.
+  const secondTries = [];
+  let tries = 0;
+  let answered = 0;
+  // The requests the run still has room for: what the cap leaves, and at most what the time left allows at the spacing alone.
+  const room = () => Math.min(cap - tries, spacingMs > 0 ? Math.floor((budgetMs - (now() - start)) / spacingMs) : Infinity);
+  for (;;) {
+    // A second try waits until the first tries are done, or until the room left is only enough for the second tries.
+    const second = secondTries.length > 0 && (firstTries.length === 0 || room() <= secondTries.length);
+    const topic = second ? secondTries[0] : firstTries[0];
+    if (!topic) break;
+    if (tries >= maxSearches) break;
+    if (tries >= cap) { if (cap < maxSearches) result.stoppedBecause = 'allowance'; break; }
     if (!(await mayRequest())) break;
+    (second ? secondTries : firstTries).shift();
+    tries += 1;
+    if (second) result.retried.push(topic.id);
     const { results, status } = await search({ q: topic.q });
+    if (status === 0) {
+      if (second) result.noAnswer.push(topic.id);
+      else secondTries.push(topic);
+      continue;
+    }
     if (status !== 200) throw new Error(`CourtListener answered ${status} to the topic search ${topic.id}; the run stopped`);
+    answered += 1;
     const records = (Array.isArray(results) ? results : []).slice(0, perTopic).map(recordFromResult).filter(Boolean);
     await saveFound(sqlClient, records, { caseType: topic.caseType, topicId: topic.id });
     await sqlClient`
@@ -148,6 +174,11 @@ export async function refreshLibrary({
     `;
     result.searched.push(topic.id);
     result.added += records.length;
+  }
+  // A topic whose second try found no room is set aside as well.
+  result.noAnswer.push(...secondTries.map(topic => topic.id));
+  if (tries > 0 && answered === 0) {
+    throw new Error(`CourtListener answered 0 to every topic search of the run (${result.noAnswer.join(', ')}); the run failed`);
   }
 
   result.dropped = await dropStale(sqlClient);

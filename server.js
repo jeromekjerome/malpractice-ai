@@ -1310,6 +1310,8 @@ app.get('/api/cron/library', async (req, res) => {
       dropped: refreshed?.dropped ?? null,
       pinsResolved: refreshed?.pinsResolved ?? null,
       stoppedBecause: refreshed ? refreshed.stoppedBecause : null,
+      noAnswer: refreshed?.noAnswer ?? null,
+      retried: refreshed?.retried ?? null,
       failed: failed.map(f => f.step),
     });
   } catch (err) {

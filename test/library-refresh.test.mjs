@@ -45,13 +45,15 @@ function fakeDb({ lastRuns = {}, stale = 0 } = {}) {
   return db;
 }
 
-// A search that answers each topic with `count` results, or the status given for it. Cluster ids run from 1000 for each topic.
+// A search that answers each topic with `count` results, or the status given for it: one status for every try, or a list of
+// them, one a try in turn, 200 once the list is spent. Cluster ids run from 1000 for each topic.
 function fakeSearch({ count = 3, statusFor = {}, costMs = 0, clock } = {}) {
   const asked = [];
   const search = async ({ q }) => {
     asked.push(q);
     if (clock) clock.t += costMs;
-    const status = statusFor[q] ?? 200;
+    const given = statusFor[q];
+    const status = (Array.isArray(given) ? given.shift() : given) ?? 200;
     if (status !== 200) return { results: [], status };
     const base = 1000 * asked.length;
     return { status, results: Array.from({ length: count }, (_, i) => ({ cluster_id: base + i, caseName: `${q} v. Case ${i}`, citation: [], opinions: [] })) };
@@ -90,7 +92,7 @@ test('the topics run oldest first, never-run ones before any that has run, and t
   const clock = fakeClock();
   const result = await run({ sqlClient: db.sql, search, perTopic: 2, clock });
   assert.deepEqual(asked, ['bravo', 'charlie', 'alpha']);
-  assert.deepEqual(result, { searched: ['auto-b', 'slip-c', 'auto-a'], added: 6, dropped: 0, pinsResolved: 0, stoppedBecause: null });
+  assert.deepEqual(result, { searched: ['auto-b', 'slip-c', 'auto-a'], added: 6, dropped: 0, pinsResolved: 0, stoppedBecause: null, noAnswer: [], retried: [] });
   assert.equal(db.saved.length, 6, 'perTopic caps what is kept');
   assert.deepEqual(db.saved.slice(0, 2).map(row => [row.case_types[0], row.topics[0]]), [['auto', 'auto-b'], ['auto', 'auto-b']]);
   assert.deepEqual(db.topicWrites, [{ id: 'auto-b', found: 2 }, { id: 'slip-c', found: 2 }, { id: 'auto-a', found: 2 }]);
@@ -127,7 +129,7 @@ test('no request is sent when the allowance has nothing to spare, or cannot be r
     const db = fakeDb();
     const { search, asked } = fakeSearch();
     const result = await run({ sqlClient: db.sql, search, allowance: async () => answer, pins: PINS, lookupPins: async () => { throw new Error('asked'); } });
-    assert.deepEqual(result, { searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: 'allowance' }, JSON.stringify(answer));
+    assert.deepEqual(result, { searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: 'allowance', noAnswer: [], retried: [] }, JSON.stringify(answer));
     assert.equal(asked.length, 0);
     assert.equal(db.queries.length, 0, 'nothing was read or written');
   }
@@ -199,8 +201,8 @@ test('the run stops with time past its budget, keeping the rows written', async 
   assert.equal(db.topicWrites.length, 2);
 });
 
-test('a throttled, failing or unreachable answer stops the run and throws, leaving the rows written and that topic as it was', async () => {
-  for (const status of [429, 500, 0]) {
+test('a refused or failing answer (401, 403, 429 or 500) stops the run at once and throws, leaving the rows written and that topic as it was', async () => {
+  for (const status of [429, 401, 403, 500]) {
     const db = fakeDb();
     const { search, asked } = fakeSearch({ statusFor: { bravo: status } });
     const { lookupPins, asked: lookups } = lookupFromFixture();
@@ -212,6 +214,105 @@ test('a throttled, failing or unreachable answer stops the run and throws, leavi
     assert.equal(lookups.length, 0);
     assert.ok(!db.queries.some(text => /screen_state =|pinned = TRUE\b.*DO UPDATE/s.test(text)), 'no row changed its state');
   }
+});
+
+test('a 429 after a search with no answer still stops the run at once: the topic waiting for its second try is not tried again', async () => {
+  const db = fakeDb();
+  const { search, asked } = fakeSearch({ statusFor: { alpha: 0, bravo: 429 } });
+  await assert.rejects(run({ sqlClient: db.sql, search }), /^Error: CourtListener answered 429 to the topic search auto-b; the run stopped$/);
+  assert.deepEqual(asked, ['alpha', 'bravo']);
+  assert.deepEqual(db.topicWrites, [], 'neither topic is marked as run');
+  assert.equal(db.deletes, 0);
+});
+
+test('a search with no answer is tried once more at the end of the run, and what the second try finds is kept', async () => {
+  const db = fakeDb();
+  const clock = fakeClock();
+  const { search, asked } = fakeSearch({ statusFor: { bravo: [0, 200] } });
+  const result = await run({ sqlClient: db.sql, search, clock });
+  assert.deepEqual(asked, ['alpha', 'bravo', 'charlie', 'bravo'], 'the second try comes after the other topics');
+  assert.deepEqual(result, { searched: ['auto-a', 'slip-c', 'auto-b'], added: 9, dropped: 0, pinsResolved: 0, stoppedBecause: null, noAnswer: [], retried: ['auto-b'] });
+  assert.deepEqual(db.topicWrites.map(write => write.id), ['auto-a', 'slip-c', 'auto-b']);
+  assert.deepEqual(clock.sleeps, [13000, 13000, 13000], 'the second try waits the spacing like any search');
+});
+
+test('a search with no answer on both tries is set aside, its topic left as it was, and the run goes on and ends well', async () => {
+  const db = fakeDb();
+  const { search, asked } = fakeSearch({ statusFor: { bravo: 0 } });
+  const result = await run({ sqlClient: db.sql, search });
+  assert.deepEqual(asked, ['alpha', 'bravo', 'charlie', 'bravo']);
+  assert.deepEqual(result, { searched: ['auto-a', 'slip-c'], added: 6, dropped: 0, pinsResolved: 0, stoppedBecause: null, noAnswer: ['auto-b'], retried: ['auto-b'] });
+  assert.deepEqual(db.topicWrites.map(write => write.id), ['auto-a', 'slip-c'], 'the topic set aside is not marked as run');
+  assert.equal(db.deletes, 1, 'the night ends as usual');
+  // Its row untouched, it is the first searched the next night.
+  const next = fakeSearch();
+  await run({ sqlClient: db.sql, search: next.search });
+  assert.equal(next.asked[0], 'bravo');
+});
+
+test('a night where no search gets an answer, on either try, fails: nothing is written and no stale row is dropped', async () => {
+  const db = fakeDb();
+  const { search, asked } = fakeSearch({ statusFor: { alpha: 0, bravo: 0, charlie: 0 } });
+  await assert.rejects(run({ sqlClient: db.sql, search }), /^Error: CourtListener answered 0 to every topic search of the run \(auto-a, auto-b, slip-c\); the run failed$/);
+  assert.deepEqual(asked, ['alpha', 'bravo', 'charlie', 'alpha', 'bravo', 'charlie'], 'each topic had its second try');
+  assert.deepEqual(db.topicWrites, []);
+  assert.equal(db.deletes, 0);
+});
+
+test('a night whose only search gets no answer and has no room for a second try fails too', async () => {
+  const db = fakeDb();
+  const { search, asked } = fakeSearch({ statusFor: { alpha: 0 } });
+  await assert.rejects(run({ sqlClient: db.sql, search, maxSearches: 1 }), /^Error: CourtListener answered 0 to every topic search of the run \(auto-a\); the run failed$/);
+  assert.deepEqual(asked, ['alpha']);
+});
+
+test('the second try takes the last search the run may send, and the topic it displaces is left for the next night', async () => {
+  const db = fakeDb();
+  const topics = { auto: Array.from({ length: 6 }, (_, i) => ({ id: `auto-${i}`, q: `topic${i}` })) };
+  const { search, asked } = fakeSearch({ statusFor: { topic0: [0, 200] } });
+  const result = await run({ sqlClient: db.sql, search, topics, maxSearches: 4 });
+  assert.deepEqual(asked, ['topic0', 'topic1', 'topic2', 'topic0'], 'four searches, the last of them the second try');
+  assert.deepEqual(result.searched, ['auto-1', 'auto-2', 'auto-0']);
+  assert.deepEqual([result.retried, result.noAnswer, result.stoppedBecause], [['auto-0'], [], null]);
+  assert.ok(!db.topicWrites.some(write => write.id === 'auto-3'), 'the topic displaced is not marked as run');
+});
+
+test('with a retry the spacing and the time budget still hold: the second try takes the last request the time has room for', async () => {
+  // A search with no answer takes the 90 s of its time limit; a search answered takes 2 s.
+  const db = fakeDb();
+  const clock = fakeClock();
+  const topics = { auto: Array.from({ length: 12 }, (_, i) => ({ id: `auto-${i}`, q: `topic${i}` })) };
+  const asked = [];
+  const startedAt = [];
+  const tries = new Map();
+  const search = async ({ q }) => {
+    asked.push(q);
+    startedAt.push(clock.t);
+    tries.set(q, (tries.get(q) || 0) + 1);
+    const silent = q === 'topic0' && tries.get(q) === 1;
+    clock.t += silent ? 90000 : 2000;
+    return silent ? { status: 0, results: [] } : { status: 200, results: [] };
+  };
+  const result = await run({ sqlClient: db.sql, search, topics, clock, budgetMs: 180000, spacingMs: 13000 });
+  assert.deepEqual(asked, ['topic0', 'topic1', 'topic2', 'topic3', 'topic4', 'topic5', 'topic0']);
+  assert.deepEqual([result.retried, result.noAnswer, result.stoppedBecause], [['auto-0'], [], 'time']);
+  assert.deepEqual(clock.sleeps, Array(6).fill(13000), 'every request after the first waits the spacing');
+  assert.ok(startedAt.every(at => at <= 180000), JSON.stringify(startedAt));
+  assert.equal(startedAt.at(-1), 178000, 'the second try starts as the last request inside the budget');
+
+  // When a slow search leaves no time for the second try, the topic is set aside and the night still ends well.
+  const db2 = fakeDb();
+  const clock2 = fakeClock();
+  const asked2 = [];
+  const slow = async ({ q }) => {
+    asked2.push(q);
+    clock2.t += q === 'topic0' ? 90000 : q === 'topic4' ? 20000 : 2000;
+    return q === 'topic0' ? { status: 0, results: [] } : { status: 200, results: [] };
+  };
+  const second = await run({ sqlClient: db2.sql, search: slow, topics, clock: clock2, budgetMs: 180000, spacingMs: 13000 });
+  assert.deepEqual(asked2, ['topic0', 'topic1', 'topic2', 'topic3', 'topic4']);
+  assert.deepEqual([second.retried, second.noAnswer, second.stoppedBecause], [[], ['auto-0'], 'time']);
+  assert.equal(db2.deletes, 1);
 });
 
 test('stale rows are dropped after the searches, and counted', async () => {

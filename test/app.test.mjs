@@ -8303,7 +8303,7 @@ test("the library route is closed without the scheduler's secret, refreshes the 
       assert.equal(CASE_TOPICS.surgical_error[0].id, FIRST_TOPIC);
       const response = await runLibrary(server.baseUrl);
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { ok: true, searched: [FIRST_TOPIC], added: 1, dropped: 0, pinsResolved: 0, stoppedBecause: null, failed: [] });
+      assert.deepEqual(await response.json(), { ok: true, searched: [FIRST_TOPIC], added: 1, dropped: 0, pinsResolved: 0, stoppedBecause: null, noAnswer: [], retried: [], failed: [] });
       assert.equal(world.courtListener.length, 2, 'one read of the usage report and one search');
       assert.ok(world.courtListener[0].includes('/api-usage/'));
       const searched = new URL(world.courtListener[1]);
@@ -8346,7 +8346,7 @@ test('the library route stops before any search when the allowance has nothing t
     await capturingLogs(() => withLibrarySettings({ searches: null }, () => withoutMail(() => withOutboundHttp(world.handler, async () => {
       const response = await runLibrary(server.baseUrl);
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { ok: true, searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: 'allowance', failed: [] });
+      assert.deepEqual(await response.json(), { ok: true, searched: [], added: 0, dropped: 0, pinsResolved: 0, stoppedBecause: 'allowance', noAnswer: [], retried: [], failed: [] });
       assert.deepEqual(world.courtListener.map(url => url.includes('/api-usage/')), [true], 'only the usage report was read');
       assert.equal(String(world.jobRuns[0][1]), 'true');
     }))));
@@ -8363,7 +8363,7 @@ test('the library route answers 500 and emails the failed step when the token is
       await withOutboundHttp(world.handler, async () => {
         const response = await runLibrary(server.baseUrl);
         assert.equal(response.status, 500);
-        assert.deepEqual(await response.json(), { ok: false, searched: null, added: null, dropped: null, pinsResolved: null, stoppedBecause: null, failed: ['refresh the case library'] });
+        assert.deepEqual(await response.json(), { ok: false, searched: null, added: null, dropped: null, pinsResolved: null, stoppedBecause: null, noAnswer: null, retried: null, failed: ['refresh the case library'] });
       });
       assert.equal(world.courtListener.length, 0);
       assert.equal(String(world.jobRuns[0][0]), 'library');
@@ -8385,7 +8385,7 @@ test('a throttled topic search makes the library route answer 500, record the ru
       await withOutboundHttp(world.handler, async () => {
         const response = await runLibrary(server.baseUrl);
         assert.equal(response.status, 500);
-        assert.deepEqual(await response.json(), { ok: false, searched: null, added: null, dropped: null, pinsResolved: null, stoppedBecause: null, failed: ['refresh the case library'] });
+        assert.deepEqual(await response.json(), { ok: false, searched: null, added: null, dropped: null, pinsResolved: null, stoppedBecause: null, noAnswer: null, retried: null, failed: ['refresh the case library'] });
       });
       assert.equal(String(world.jobRuns[0][1]), 'false');
       assert.match(String(world.jobRuns[0][2]), new RegExp(`CourtListener answered 429 to the topic search ${FIRST_TOPIC}; the run stopped`));

@@ -113,8 +113,8 @@ async function resolvePins({ sqlClient, unresolved, lookupPins }) {
 // It throws, leaving the rows already written and that topic's last-run time untouched:
 // - at once, when CourtListener answers a topic search with any other status but a result (a refusal such as 401, 403 or
 //   429, or a 5xx);
-// - at the end, when no request of the run got an answer at all, neither the pin lookup nor a search: an outage. No stale
-//   row is dropped that night.
+// - at the end, when no topic search of the run got an answer, an outage, unless the run sent a single search try and the
+//   pin lookup answered. No stale row is dropped that night.
 export async function refreshLibrary({
   sqlClient, topics, search, lookupPins, pins = [], allowance, now = Date.now, sleep = wait,
   maxSearches = 10, perTopic = 8, spacingMs = 13000, budgetMs = 240000, reserve = 30, hourReserve = 5,
@@ -140,7 +140,7 @@ export async function refreshLibrary({
 
   // The pins come first, so that the searches, which can fill the whole night, never leave them waiting. The lookup is one
   // request, not one of the searches; a lookup that fails leaves the pins for tomorrow and the night goes on.
-  // Whether CourtListener answered any request of the run, the pin lookup or a search. A run with none answered fails.
+  // Whether CourtListener answered any request of the run, the pin lookup or a search (see the failure rule at the end).
   let answered = false;
   const unresolved = await unresolvedPins(sqlClient, pins);
   if (unresolved.length && await mayRequest()) {
@@ -201,7 +201,10 @@ export async function refreshLibrary({
   }
   // A topic whose second try found no room is set aside as well.
   result.noAnswer.push(...secondTries.map(topic => topic.id));
-  if (tries > 0 && !answered) {
+  // A night in which no topic search got an answer fails: an outage. A pin lookup that answered excuses only a night of a
+  // single search try, since CourtListener was up and one slow search is no outage; several searches all without an answer
+  // still fail the night, and the owner is emailed.
+  if (tries > 0 && searchesAnswered === 0 && !(answered && tries === 1)) {
     throw new Error(`CourtListener answered 0 to every topic search of the run (${result.noAnswer.join(', ')}); the run failed`);
   }
 

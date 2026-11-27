@@ -477,6 +477,19 @@ test('a pin lookup that answers counts as an answer: a night whose one search ge
   }
 });
 
+test('a pin lookup that answers excuses only a night of one search try: several searches all without an answer still fail the night', async () => {
+  for (const maxSearches of [2, 10]) {
+    const db = fakeDb();
+    const { search, asked } = fakeSearch({ statusFor: { alpha: 0, bravo: 0, charlie: 0 } });
+    const { lookupPins, asked: lookups } = lookupFromFixture();
+    await assert.rejects(run({ sqlClient: db.sql, search, pins: PINS, lookupPins, maxSearches }), /^Error: CourtListener answered 0 to every topic search of the run \(.+\); the run failed$/, String(maxSearches));
+    assert.equal(lookups.length, 1, 'the lookup answered');
+    assert.equal(asked.length, maxSearches === 2 ? 2 : 6, 'every search try the run had room for');
+    assert.deepEqual(db.topicWrites, []);
+    assert.equal(db.deletes, 0);
+  }
+});
+
 test('a cluster becomes a record: ids, citations, the Court of Appeals by its reporter, and nothing without an id or a name', () => {
   const rodriguez = recordFromCluster(LOOKUP[0].clusters[0]);
   assert.deepEqual(rodriguez, {

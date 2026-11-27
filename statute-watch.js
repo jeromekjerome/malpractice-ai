@@ -234,7 +234,8 @@ function listingBlock({ source, read }, { law }) {
   if (requirements.length) parts.push(`<p>What the site does:</p>${requirementItems(requirements)}`);
   parts.push(`<p>If an opinion concerns lead services, paid recommendations, advertising, solicitation or AI intake, compare it with ${requirements.length ? 'the list above' : 'what the site does'} and take it to a lawyer. Otherwise mark it reviewed. Mark each one reviewed once you have read it, including any you take to a lawyer.</p>`);
   parts.push(officialPage(source));
-  parts.push(`<p>To mark them reviewed: <code>npm run law:reviewed -- ${[source.id, ...numbers].map(escapeHtml).join(' ')}</code> Then commit the notes file and push it in both apps; until it is pushed, the watch keeps listing them.</p>`);
+  parts.push(`<p>To mark them reviewed, run <code>npm run law:reviewed -- ${[source.id, ...numbers].map(escapeHtml).join(' ')}</code> in the app's folder (or ask Claude to), then commit the notes file and push it. `
+    + 'Do this in both apps: until the push is live, the watch lists them every night.</p>');
   return parts.join('');
 }
 
@@ -275,8 +276,9 @@ function changedBlock(notice, context) {
   parts.push(officialPage(source));
   // law approve refuses a repealed text, which no saved text can match, so a repeal is not offered a command that would fail.
   parts.push(read.repealed
-    ? '<p>The approval command refuses a repealed section: edit the source and the notes that rest on it by hand.</p>'
-    : `<p>To approve the new text: <code>npm run law:approve -- ${escapeHtml(source.id)} ${escapeHtml(fingerprint)}</code></p>`);
+    ? '<p>A repealed section cannot be approved with a command. Edit its entry and the notes that rest on it in the notes file by hand (or ask Claude to), then commit and push.</p>'
+    : `<p>To approve the new text, run <code>npm run law:approve -- ${escapeHtml(source.id)} ${escapeHtml(fingerprint)}</code> in the app's folder (or ask Claude to). `
+      + 'It saves the new text as the approved one; then commit and push.</p>');
   return parts.join('');
 }
 
@@ -513,22 +515,30 @@ function runLine(lastRun, moment, count) {
 }
 
 // The by-hand sources that are overdue for a review or have never had one, from the law alone: the watch cannot read them.
+// One line names them all, each a link to its official text when it has a web address, and one more gives the one command
+// that marks them all reviewed. Both are HTML already, escaped piece by piece, so that the command can be set in <code>.
 function reviewLines(law, today) {
-  const lines = [];
+  const due = [];
   for (const source of Array.isArray(law?.sources) ? law.sources : []) {
     if (source?.kind !== 'by_hand') continue;
-    // Each line is HTML already, escaped piece by piece, so that the command can be set in <code>.
-    const command = `Review it, then run <code>npm run law:reviewed -- ${escapeHtml(source.id)}</code>.`;
-    const requirements = requirementsResting(law, source.id);
-    const resting = requirements.length ? `<p>The requirements that rest on it:</p>${requirementItems(requirements)}` : '';
     if (source.reviewed_on == null) {
-      lines.push(`<p>${escapeHtml(`${nameOf(source)} has not been reviewed by hand yet.`)} ${command}</p>${resting}`);
+      due.push({ source, when: 'not yet reviewed' });
       continue;
     }
     const days = daysBetween(String(source.reviewed_on), today);
-    if (days >= REVIEW_DUE_DAYS) lines.push(`<p>${escapeHtml(`${nameOf(source)} was last reviewed by hand on ${dayLabel(String(source.reviewed_on))}, ${days} days ago.`)} ${command}</p>${resting}`);
+    if (days >= REVIEW_DUE_DAYS) due.push({ source, when: `last reviewed by hand on ${dayLabel(String(source.reviewed_on))}, ${days} days ago` });
   }
-  return lines;
+  if (!due.length) return [];
+  const named = ({ source, when }) => {
+    const url = String(source.url ?? '');
+    const name = escapeHtml(nameOf(source));
+    return `${/^https?:\/\//i.test(url) ? `<a href="${escapeHtml(url)}">${name}</a>` : name} (${escapeHtml(when)})`;
+  };
+  const one = due.length === 1;
+  return [
+    `<p>${one ? '1 source waits' : `${due.length} sources wait`} for your review by hand: ${due.map(named).join(', ')}.</p>`,
+    `<p>Mark ${one ? 'it' : 'them'} reviewed with <code>npm run law:reviewed -- ${due.map(({ source }) => escapeHtml(source.id)).join(' ')}</code> in the app's folder (or ask Claude to).</p>`,
+  ];
 }
 
 /**

@@ -265,7 +265,8 @@ test('a changed section sends one email with its notes, its places, the marked c
     assert.match(html, /<del>three<\/del>/);
     assert.match(html, /<ins>two<\/ins>/);
     assert.ok(html.includes('https://www.nysenate.gov/legislation/laws/CVP/214'));
-    assert.ok(html.includes(`npm run law:approve -- CPLR-214 ${fingerprintOf(CHANGED_214)}`));
+    assert.ok(html.includes(`<p>To approve the new text, run <code>npm run law:approve -- CPLR-214 ${fingerprintOf(CHANGED_214)}</code> in the app's folder (or ask Claude to). `
+      + 'It saves the new text as the approved one; then commit and push.</p>'), html);
     assert.ok(html.includes('Until you approve the new text (or, for a repealed section, edit the source and the notes by hand), replies keep using the approved notes. If the rule changed, edit the note and every place listed in the same commit, then push.'));
     assert.ok(keyless(html));
     const row = table.row('CPLR-214');
@@ -506,7 +507,7 @@ test('a repealed section is a change that says so', async () => {
   assert.match(html, /repealed on 2026-05-26/);
   // law approve refuses a repealed text, so the email offers no command that would be refused: the notes are edited by hand.
   assert.doesNotMatch(html, /npm run law:approve --/);
-  assert.match(html, /by hand/);
+  assert.ok(html.includes('<p>A repealed section cannot be approved with a command. Edit its entry and the notes that rest on it in the notes file by hand (or ask Claude to), then commit and push.</p>'), html);
   assert.equal(table.row('CPLR-214').emailed_fingerprint, statuteFingerprint(repealed));
 });
 
@@ -820,16 +821,29 @@ test('the summary lists a by-hand source at 90 days and not at 89, and one never
   };
   const w = world({ law });
   const html = await summaryOf(w, { ranAt: hoursBefore(6), ok: true });
-  assert.ok(html.includes('A rule &lt;b&gt;&amp;&lt;/b&gt; reviewed at ninety days was last reviewed by hand on Aug 25, 2026, 90 days ago. '
-    + 'Review it, then run <code>npm run law:reviewed -- RULE-90</code>.'));
-  assert.ok(html.includes('A rule never reviewed has not been reviewed by hand yet. Review it, then run <code>npm run law:reviewed -- RULE-NEW</code>.'));
-  assert.ok(html.includes('<code>npm run law:reviewed -- ') && !html.includes('`'), 'the command is HTML code, with no Markdown backtick');
+  const waiting = '<p>2 sources wait for your review by hand: <a href="https://example.test/">A rule &lt;b&gt;&amp;&lt;/b&gt; reviewed at ninety days</a> (last reviewed by hand on Aug 25, 2026, 90 days ago), '
+    + '<a href="https://example.test/">A rule never reviewed</a> (not yet reviewed).</p>';
+  const command = '<p>Mark them reviewed with <code>npm run law:reviewed -- RULE-90 RULE-NEW</code> in the app\'s folder (or ask Claude to).</p>';
+  assert.ok(html.includes(waiting + command), html);
+  assert.ok(!html.includes('`'), 'the command is HTML code, with no Markdown backtick');
+  assert.equal(html.split('law:reviewed').length, 2, 'the command is given once');
   assert.doesNotMatch(html, /RULE-89|eighty-nine/);
   assert.doesNotMatch(html, /<b>/);
   // These lines come from the law alone, so they stay when the table cannot be read.
   w.table.gone();
   const without = await summaryOf(w, { ranAt: hoursBefore(6), ok: true });
-  assert.ok(without.includes('<code>npm run law:reviewed -- RULE-90</code>') && without.includes('<code>npm run law:reviewed -- RULE-NEW</code>'));
+  assert.ok(without.includes(waiting + command), without);
+});
+
+test('one source due for review is named alone, and a source with no web address is named without a link', async () => {
+  const law = {
+    sources: [section('CPLR-214'), { id: 'RULE-ONE', kind: 'by_hand', name: 'A rule with no page', url: 'not an address', reviewed_on: null }],
+    notes: [], register: [],
+  };
+  const html = await summaryOf(world({ law }), { ranAt: hoursBefore(6), ok: true });
+  assert.ok(html.includes('<p>1 source waits for your review by hand: A rule with no page (not yet reviewed).</p>'
+    + '<p>Mark it reviewed with <code>npm run law:reviewed -- RULE-ONE</code> in the app\'s folder (or ask Claude to).</p>'), html);
+  assert.doesNotMatch(html, /<a href="not/);
 });
 
 test('the summary lists the sections that could not be read', async () => {
@@ -911,8 +925,8 @@ test('a listing with new opinions sends one email naming each opinion, every req
   for (const requirement of REQUIREMENTS) assert.ok(html.includes(requirement.id), requirement.id);
   assert.ok(html.includes('Shows the notice &lt;before&gt; typing &amp; more'));
   assert.ok(html.includes('Charges a firm its subscription'), 'every requirement, not only those resting on the listing');
-  assert.ok(html.includes('npm run law:reviewed -- NYSBA-OPINIONS 1310 1311'));
-  assert.ok(html.includes('Then commit the notes file and push it in both apps; until it is pushed, the watch keeps listing them.'));
+  assert.ok(html.includes('<p>To mark them reviewed, run <code>npm run law:reviewed -- NYSBA-OPINIONS 1310 1311</code> in the app\'s folder (or ask Claude to), then commit the notes file and push it. '
+    + 'Do this in both apps: until the push is live, the watch lists them every night.</p>'), html);
   assert.ok(html.includes('<p>Nothing on the site changes until you act.</p>'));
   assert.ok(!html.includes('Senate'));
   assert.equal(table.row('NYSBA-OPINIONS').emailed_fingerprint, fingerprintOf(listingRead(OPINIONS).text));
@@ -1004,12 +1018,11 @@ test('the summary counts sections and bills only, and says when new opinions hav
   assert.doesNotMatch(html, /differs? from the approved text/);
 });
 
-test('a by-hand reminder lists the requirements resting on that source', async () => {
+test('a by-hand reminder is the one line naming the source and the one command, without the requirements resting on it', async () => {
   const w = world({ law: listingLaw() });
   const html = await summaryOf(w, { ranAt: hoursBefore(6), ok: true });
   assert.ok(html.includes('npm run law:reviewed -- BY-HAND-ONE'));
-  assert.ok(html.includes('REQ-THREE') && html.includes('Charges a firm its subscription'));
-  assert.ok(!html.includes('REQ-ONE'));
+  assert.ok(!html.includes('REQ-THREE') && !html.includes('The requirements that rest on it'), html);
 });
 
 test('a shrinking list of unmarked opinions sends one more email, and the same list the next night sends none', async () => {

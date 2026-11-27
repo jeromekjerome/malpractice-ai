@@ -220,21 +220,54 @@ const REPLIES_FROM_LIBRARY = 'replies-library';
 const REPLIES_LIVE = 'replies-live';
 const ALLOWANCE_READ_MS = 5000;
 
+// The last run of the library refresh, for the daily summary: its time and the topics it searched, set aside with no answer and
+// tried twice. The refresh runs in its own function hours before the summary, so the library route keeps it in app_settings
+// under this key (setup-db.js), written over each night. Only a run that ended well writes it.
+export const LIBRARY_LAST_RUN_KEY = 'library_last_run';
+const LAST_NIGHT_MS = 20 * HOUR;
+
+export async function recordLibraryRun(result, at = new Date()) {
+  const ids = list => (Array.isArray(list) ? list.map(String) : []);
+  const value = { at: new Date(at).toISOString(), searched: ids(result?.searched), noAnswer: ids(result?.noAnswer), retried: ids(result?.retried) };
+  await sql`
+    INSERT INTO app_settings (key, value, updated_at) VALUES (${LIBRARY_LAST_RUN_KEY}, ${JSON.stringify(value)}::jsonb, NOW())
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`;
+}
+
+// The topics last night's refresh set aside with no answer: [] when there were none, and null when the row is missing,
+// unreadable or older than last night, so that the summary leaves the line out.
+async function setAsideLastNight() {
+  try {
+    const [row] = await sql`SELECT value FROM app_settings WHERE key = ${LIBRARY_LAST_RUN_KEY}`;
+    const value = typeof row?.value === 'string' ? JSON.parse(row.value) : row?.value;
+    const at = Date.parse(value?.at);
+    if (!Number.isFinite(at) || Date.now() - at > LAST_NIGHT_MS || !Array.isArray(value.noAnswer)) return null;
+    return value.noAnswer.map(String);
+  } catch (err) {
+    console.error('[digest] The last library run could not be read, so the summary goes without its topics set aside:', withoutKeys(err?.message ?? err));
+    return null;
+  }
+}
+
 async function caseLibrarySection() {
   try {
-    const [counts, usage] = await Promise.all([libraryCounts(sql), usageToday(sql, new Date(Date.now() - 24 * 60 * 60 * 1000))]);
+    const [counts, usage, setAside] = await Promise.all([libraryCounts(sql), usageToday(sql, new Date(Date.now() - 24 * 60 * 60 * 1000)), setAsideLastNight()]);
     const token = process.env.COURTLISTENER_TOKEN;
     const allowance = token ? await timeLimit(readAllowance({ token }), ALLOWANCE_READ_MS, 'The usage report').catch(() => null) : null;
     const types = Object.keys(CASE_TOPICS);
     const of = type => counts.byType[type] || { clear: 0, unscreened: 0, held: 0 };
+    const hasAny = type => of(type).clear + of(type).unscreened + of(type).held > 0;
     const few = types.filter(type => of(type).clear < MIN_CLEAR_DECISIONS);
     const isReply = row => row.job.startsWith('replies-');
     const requests = usage.filter(row => !isReply(row));
     const repliesOf = job => usage.find(row => row.job === job)?.requests ?? 0;
-    return `<ul>${types.map(type => `<li>${escapeHtml(type)}: ${of(type).clear} clear, ${of(type).unscreened} unscreened, ${of(type).held} held</li>`).join('')}</ul>` +
+    const none = types.filter(type => !hasAny(type));
+    return `${types.some(hasAny) ? `<ul>${types.filter(hasAny).map(type => `<li>${escapeHtml(type)}: ${of(type).clear} clear, ${of(type).unscreened} unscreened, ${of(type).held} held</li>`).join('')}</ul>` : ''}` +
+      `${none.length ? `<p>No decisions yet: ${none.map(escapeHtml).join(', ')}.</p>` : ''}` +
       `<p>Held for your decision: ${counts.held}.${counts.held > 0 ? ` Clear or ban them on the <a href="${escapeHtml(APP_URL)}/admin.html">admin page</a>.` : ''}</p>` +
       `<p>Types with fewer than ${MIN_CLEAR_DECISIONS} clear decisions: ${few.length ? few.map(escapeHtml).join(', ') : 'none'}.</p>` +
       `<p>CourtListener requests yesterday (New York day): ${requests.length ? requests.map(row => `${escapeHtml(row.job)} ${row.requests}`).join(', ') : 'none'}.</p>` +
+      `${setAside?.length ? `<p>Topics set aside last night with no answer from CourtListener: ${listed(setAside.map(escapeHtml))}. They are first in line at the next refresh.</p>` : ''}` +
       `<p>Replies yesterday: ${repliesOf(REPLIES_FROM_LIBRARY)} from the library, ${repliesOf(REPLIES_LIVE)} live.</p>` +
       `<p>${allowance ? `CourtListener allowance left: ${allowance.day} today, ${allowance.hour} this hour.` : 'The CourtListener allowance left could not be read.'}</p>`;
   } catch (err) {
@@ -496,7 +529,7 @@ export async function reportFailedSteps(job, failed) {
 }
 
 // A summary of the last day for the operator, sent with the nightly job (DAILY_DIGEST=off stops it). It also shows
-// that the job ran. Requests no firm holds are listed so they can be delivered by hand from the admin page.
+// that the job ran. The requests waiting for a firm are counted so they can be delivered by hand from the admin page.
 export async function sendDailyDigest({ failed = [] } = {}) {
   if (process.env.DAILY_DIGEST === 'off') return false;
   const [day] = await sql`
@@ -507,9 +540,6 @@ export async function sendDailyDigest({ failed = [] } = {}) {
       (SELECT count(*) FROM user_interactions WHERE created_at > NOW() - INTERVAL '24 hours' AND gate_status = 'BLOCKED')::int AS blocked,
       (SELECT count(*) FROM conversations WHERE contact_consent_at > NOW() - INTERVAL '24 hours')::int AS requests,
       (SELECT count(*) FROM leads WHERE created_at > NOW() - INTERVAL '24 hours')::int AS leads,
-      (SELECT count(*) FROM ai_usage WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'ok')::int AS ai_calls,
-      (SELECT COALESCE(SUM(input_tokens), 0) FROM ai_usage WHERE created_at > NOW() - INTERVAL '24 hours')::int AS ai_input_tokens,
-      (SELECT COALESCE(SUM(output_tokens), 0) FROM ai_usage WHERE created_at > NOW() - INTERVAL '24 hours')::int AS ai_output_tokens,
       (SELECT COALESCE(SUM(actual_cost_usd), 0) FROM ai_usage WHERE created_at > NOW() - INTERVAL '24 hours') AS ai_cost,
       (SELECT count(*) FROM conversations c WHERE c.contact_consent_at > NOW() - INTERVAL '7 days'
          AND NOT EXISTS (SELECT 1 FROM leads l WHERE l.session_id = c.session_id)
@@ -533,11 +563,8 @@ export async function sendDailyDigest({ failed = [] } = {}) {
         ${row('Replies the gate blocked', day?.blocked)}
         ${row('Contact requests', day?.requests)}
         ${row('Leads delivered', day?.leads)}
-        ${row('AI calls', day?.ai_calls)}
-        ${row('AI input tokens', day?.ai_input_tokens)}
-        ${row('AI output tokens', day?.ai_output_tokens)}
         ${row('Estimated AI spend (USD)', `$${Number(day?.ai_cost || 0).toFixed(2)}`)}
-        ${row('Requests no firm holds (last 7 days)', day?.unplaced)}
+        ${row('Requests waiting for a firm (last 7 days)', day?.unplaced)}
       </table>
       ${day?.unplaced ? `<p>Deliver waiting requests by hand from the <a href="${escapeHtml(APP_URL)}/admin.html">admin page</a>.</p>` : ''}
       ${replies ? repliesLine(replies) : ''}

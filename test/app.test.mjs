@@ -8416,6 +8416,14 @@ test("the library route is closed without the scheduler's secret, refreshes the 
       assert.equal(world.jobRuns.length, 1);
       assert.equal(String(world.jobRuns[0][0]), 'library');
       assert.equal(String(world.jobRuns[0][1]), 'true');
+      // The run's topics are kept for the daily summary, which is made hours later in another function.
+      const lastRun = world.sql.filter(call => /^INSERT INTO app_settings/.test(call.query));
+      assert.equal(lastRun.length, 1);
+      assert.match(lastRun[0].query, /ON CONFLICT \(key\) DO UPDATE SET value = EXCLUDED\.value/);
+      assert.equal(lastRun[0].params[0], 'library_last_run');
+      const value = JSON.parse(lastRun[0].params[1]);
+      assert.ok(Math.abs(Date.parse(value.at) - Date.now()) < 60_000, value.at);
+      assert.deepEqual({ ...value, at: 'now' }, { at: 'now', searched: [FIRST_TOPIC], noAnswer: [], retried: [] });
     }))));
   } finally {
     await server.close();
@@ -8486,6 +8494,7 @@ test('a throttled topic search makes the library route answer 500, record the ru
       });
       assert.equal(String(world.jobRuns[0][1]), 'false');
       assert.match(String(world.jobRuns[0][2]), new RegExp(`CourtListener answered 429 to the topic search ${FIRST_TOPIC}; the run stopped`));
+      assert.ok(!world.sql.some(call => /^INSERT INTO app_settings/.test(call.query)), 'a failed run leaves the last run kept for the summary as it was');
       assert.ok(!world.sql.some(call => /^INSERT INTO library_topics|^DELETE FROM case_library/.test(call.query)), 'the topic was marked as run, or stale rows were dropped');
       assert.equal(sent.length, 1);
     })));
@@ -8842,6 +8851,35 @@ test('the admin routes answer 500 with the generic message when the database fai
   }
 });
 
+test('the daily summary\'s table keeps what the owner acts on: the AI spend without the calls and tokens, and the requests waiting for a firm', async () => {
+  const { sendDailyDigest } = await import('../operations.js');
+  const queries = [];
+  const handler = async (url, init = {}) => {
+    if (url.includes('/api-usage/')) return jsonResponse(usageReportWith({ day: 90, hour: 40 }));
+    if (!url.endsWith('/sql')) throw new Error(`Unexpected outbound request in test: ${url}`);
+    const query = JSON.parse(init.body).query.replace(/\s+/g, ' ').trim();
+    queries.push(query);
+    if (/^SELECT \(SELECT count\(\*\) FROM user_interactions/.test(query)) {
+      return rowsResponse([['messages', INT], ['errors', INT], ['slow', INT], ['blocked', INT], ['requests', INT], ['leads', INT], ['ai_cost', TEXT], ['unplaced', INT]],
+        [['12', '1', '2', '0', '3', '1', '0.4567', '2']]);
+    }
+    return jsonResponse(EMPTY_ROWS);
+  };
+  let html = '';
+  await capturingLogs(() => withDigest(() => withOperatorMail(async sent => {
+    await withOutboundHttp(handler, () => sendDailyDigest());
+    html = String(sent[0].html);
+  })));
+  const row = (label, value) => `<tr><td style="color:#666;padding:4px 12px 4px 0">${label}</td><td><strong>${value}</strong></td></tr>`;
+  for (const [label, value] of [['Chat messages', 12], ['Failed', 1], ['Ran out of time', 2], ['Estimated AI spend (USD)', '$0.46'], ['Requests waiting for a firm (last 7 days)', 2]]) {
+    assert.ok(html.includes(row(label, value)), `${label}: ${html}`);
+  }
+  assert.doesNotMatch(html, /AI calls|AI input tokens|AI output tokens|Requests no firm holds/);
+  assert.ok(html.includes('Deliver waiting requests by hand from the'), html);
+  const day = queries.find(query => /^SELECT \(SELECT count\(\*\) FROM user_interactions/.test(query));
+  assert.doesNotMatch(day, /input_tokens|output_tokens|AS ai_calls/, 'the summary no longer reads what it does not show');
+});
+
 test("the daily summary carries a case library section: counts by type, the types short of clear decisions, the previous New York day's requests and replies, and what is left of the allowance", async () => {
   const { sendDailyDigest } = await import('../operations.js');
   const { CASE_TOPICS } = await import('../case-topics.js');
@@ -8869,6 +8907,13 @@ test("the daily summary carries a case library section: counts by type, the type
       usageDays.push(JSON.parse(init.body).params[0]);
       return rowsResponse([['job', TEXT], ['requests', INT]], [['chat-search', '4'], ['gate-lookup', '2'], ['library', '10'], ['replies-library', '7'], ['replies-live', '3']]);
     }
+    // The last library run, kept by the library route: fresh with a topic set aside, unreadable, or two nights old.
+    if (/FROM app_settings WHERE key/.test(query) && JSON.parse(init.body).params[0] === 'library_last_run') {
+      if (state === 'no-allowance') return jsonResponse({ message: 'canceling statement due to statement timeout' }, 500);
+      const hoursAgo = state === 'none-held' ? 30 : 4;
+      const value = { at: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(), searched: ['surgical-error-departure'], noAnswer: ['surgical-error-wrong-site', 'misdiagnosis-radiology'], retried: ['surgical-error-wrong-site'] };
+      return rowsResponse([['value', JSONB]], [[JSON.stringify(value)]]);
+    }
     return jsonResponse(EMPTY_ROWS);
   };
   const summaries = [];
@@ -8888,17 +8933,21 @@ test("the daily summary carries a case library section: counts by type, the type
   const [full, noAllowance, broken, noneHeld] = summaries;
   assert.ok(full.includes('Case library'));
   assert.ok(full.includes(`<p>Held for your decision: 2. Clear or ban them on the <a href="${process.env.APP_URL}/admin.html">admin page</a>.</p>`), full);
-  assert.ok(full.includes('</ul><p>Held for your decision'), 'the line follows the per-type list');
+  const empty = Object.keys(CASE_TOPICS).filter(type => !['surgical_error', 'misdiagnosis'].includes(type));
+  assert.ok(full.includes(`</ul><p>No decisions yet: ${empty.join(', ')}.</p><p>Held for your decision`), 'only the types with decisions are listed, then one line for the rest, then the held line');
   assert.ok(noAllowance.includes(`<p>Held for your decision: 1. Clear or ban them on the <a href="${process.env.APP_URL}/admin.html">admin page</a>.</p>`), noAllowance);
   assert.ok(noneHeld.includes('<p>Held for your decision: 0.</p>'), noneHeld);
   assert.ok(!noneHeld.includes('Clear or ban them'), 'a link to nothing to decide');
   assert.ok(full.includes('<li>surgical_error: 6 clear, 2 unscreened, 0 held</li>'), full);
   assert.ok(full.includes('<li>misdiagnosis: 4 clear, 0 unscreened, 1 held</li>'), full);
-  assert.ok(full.includes('<li>other: 0 clear, 0 unscreened, 0 held</li>'), 'a type with no rows counts as 0');
-  assert.equal((full.match(/<li>[a-z_]+: \d+ clear/g) || []).length, Object.keys(CASE_TOPICS).length, 'every case type has its line');
+  assert.ok(!full.includes('<li>other:'), 'a type with no decisions is not listed');
+  assert.equal((full.match(/<li>[a-z_]+: \d+ clear/g) || []).length, 2, 'only the case types with decisions have a line');
   const short = Object.keys(CASE_TOPICS).filter(type => type !== 'surgical_error').join(', ');
   assert.ok(full.includes(`<p>Types with fewer than 5 clear decisions: ${short}.</p>`), full);
-  assert.ok(full.includes('<p>CourtListener requests yesterday (New York day): chat-search 4, gate-lookup 2, library 10.</p>'), full);
+  assert.ok(full.includes('<p>CourtListener requests yesterday (New York day): chat-search 4, gate-lookup 2, library 10.</p>'
+    + '<p>Topics set aside last night with no answer from CourtListener: surgical-error-wrong-site and misdiagnosis-radiology. They are first in line at the next refresh.</p>'), full);
+  assert.doesNotMatch(noAllowance, /set aside/, 'a last run that cannot be read leaves the line out');
+  assert.doesNotMatch(noneHeld, /set aside/, 'a run older than last night leaves the line out');
   assert.ok(full.includes('<p>Replies yesterday: 7 from the library, 3 live.</p>'), full);
   assert.ok(full.includes('<p>CourtListener allowance left: 90 today, 40 this hour.</p>'), full);
   const dayAskedAfter = newYorkDayOf(Date.now() - 24 * 60 * 60 * 1000);

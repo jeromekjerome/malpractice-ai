@@ -202,6 +202,8 @@ async function setup() {
 
   // The app's settings, one row a setting (model-settings.js). The row model_chains holds the chains each job runs
   // with, saved from the admin page; without it, or without this table, the built-in chains of models.js are used.
+  // The row library_last_run holds the last library refresh's topics (searched, set aside with no answer, tried twice),
+  // written by the library route for the daily summary (operations.js); without it the summary leaves that line out.
   await sql`
     CREATE TABLE IF NOT EXISTS app_settings (
       key         TEXT PRIMARY KEY,

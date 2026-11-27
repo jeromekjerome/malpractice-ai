@@ -10,7 +10,7 @@ import { answerUserQuestion, noticeForReply } from './ask.js';
 import { closeExpiredAuctions, createAuction, deliverColdLead, getAuctionStatus, placeBid, acceptLead, declineLead, notifyOperatorOfContactRequest, notifyOperator, sendOperatorNotice, TIER_CONFIG, DECLINE_REASONS, deliverLeadByHand, remindClosingAuctions, openAuctionsFor, portalAuctionLink } from './auction.js';
 import { registerFirm, sendVerificationCode, verifyPhoneCode, validateToken, updateFirmSubscription, getFirm, updateFirmProfile, createMagicLink, VerificationLimitError, recentDeclineCounts, linkOpensAuction, linkOpensLead, linkOpensAccount, approveFirm, setSubscriptionStatus, ensureStripeCustomer, changeUnverifiedPhone, setCustomerCard, findFirmByEmail } from './firms.js';
 import { rateLimit } from './rate-limit.js';
-import { alertOperatorOnce, tellOwnerOfProviders, tellOwnerOfModelChains, recordInteraction, deepHealth, runSteps, recordJobRun, reportFailedSteps, sendDailyDigest } from './operations.js';
+import { alertOperatorOnce, tellOwnerOfProviders, tellOwnerOfModelChains, recordInteraction, deepHealth, runSteps, recordJobRun, recordLibraryRun, reportFailedSteps, sendDailyDigest } from './operations.js';
 import nodemailer from 'nodemailer';
 import { createSubscriptionCheckout, createPortalSession, constructWebhookEvent, getSubscriptionDetails, getCustomerCard, liveSubscription } from './stripe.js';
 import { runJob, replyClock, MIN_TIME_LEFT_MS, configureProviders, withoutKeys, providerPing, providerStates, adaptersFor } from './providers.js';
@@ -1303,6 +1303,8 @@ app.get('/api/cron/library', async (req, res) => {
     await recordJobRun('library', failed).catch(err => console.error('Recording the case library run failed:', err.message));
     await reportFailedSteps('case library', failed);
     const refreshed = results['refresh the case library'];
+    // The daily summary, made hours later by the nightly job, names the topics set aside with no answer.
+    if (refreshed) await recordLibraryRun(refreshed).catch(err => console.error('Keeping the case library run for the daily summary failed:', withoutKeys(err.message)));
     res.status(failed.length ? 500 : 200).json({
       ok: failed.length === 0,
       searched: refreshed?.searched ?? null,

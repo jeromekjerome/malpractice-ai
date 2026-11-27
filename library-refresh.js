@@ -11,6 +11,9 @@ import { saveFound, savePinned, pinnedCitations, dropStale, recordFromResult, wo
 import { allowanceLeft } from './courtlistener-usage.js';
 
 const COURT_OF_APPEALS_REPORTERS = new Set(['n.y.', 'n.y.2d', 'n.y.3d']);
+// The time kept for each answer in the room left for requests (refreshLibrary): a topic search CourtListener has run before
+// answers in a few seconds.
+const ANSWER_ROOM_MS = 5000;
 
 const normalized = citation => String(citation ?? '').toLowerCase().replace(/\s+/g, '');
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -79,11 +82,12 @@ export async function unresolvedPins(sqlClient, pins) {
 }
 
 // Looks the unresolved pins up in one request and keeps what is found, pinned. A pin not found waits for the next night.
+// Returns how many were kept, and whether CourtListener answered.
 async function resolvePins({ sqlClient, unresolved, lookupPins }) {
   const { status, body } = await lookupPins({ text: unresolved.map(pin => pin.citation).join('\n') });
   if (status !== 200) {
     console.warn(`CourtListener answered ${status} to the citation lookup of the pinned decisions; they are looked up again tomorrow.`);
-    return 0;
+    return { saved: 0, answered: false };
   }
   const entries = Array.isArray(body) ? body : [];
   const records = [];
@@ -96,18 +100,21 @@ async function resolvePins({ sqlClient, unresolved, lookupPins }) {
     if (record) records.push(record);
     else console.warn(`The pinned decision ${pin.citation} (${pin.name}) was not found by the citation lookup; it is looked up again tomorrow.`);
   }
-  return savePinned(sqlClient, records);
+  return { saved: await savePinned(sqlClient, records), answered: true };
 }
 
 // One night's refresh. Returns what it did. A topic search with no answer (status 0: no answer within the time limit, or a
 // network error) is tried once more in the same run, in the last search the run has room for: room counted by the searches
-// the run may send and by the requests the time left allows at the spacing. A topic with no answer on both tries, or with no
-// room left for its second try, is set aside: its last-run time is untouched, so it is first in line the next night. The
-// result names the topics set aside (`noAnswer`) and the topics tried twice (`retried`).
+// the run may send and by the requests the time left allows at the spacing. Until a search of the run has an answer, a topic
+// with no answer brings the topic run longest ago forward, ahead of the topics never run. A topic with no answer on both
+// tries, or with no room left for its second try, is set aside: its last-run time is untouched, so it keeps its place in
+// line, ahead of the topics searched since. The result names the topics set aside (`noAnswer`) and the topics tried twice
+// (`retried`).
 // It throws, leaving the rows already written and that topic's last-run time untouched:
 // - at once, when CourtListener answers a topic search with any other status but a result (a refusal such as 401, 403 or
 //   429, or a 5xx);
-// - at the end, when no search of the run got an answer at all, an outage; no stale row is dropped that night.
+// - at the end, when no request of the run got an answer at all, neither the pin lookup nor a search: an outage. No stale
+//   row is dropped that night.
 export async function refreshLibrary({
   sqlClient, topics, search, lookupPins, pins = [], allowance, now = Date.now, sleep = wait,
   maxSearches = 10, perTopic = 8, spacingMs = 13000, budgetMs = 240000, reserve = 30, hourReserve = 5,
@@ -133,19 +140,26 @@ export async function refreshLibrary({
 
   // The pins come first, so that the searches, which can fill the whole night, never leave them waiting. The lookup is one
   // request, not one of the searches; a lookup that fails leaves the pins for tomorrow and the night goes on.
+  // Whether CourtListener answered any request of the run, the pin lookup or a search. A run with none answered fails.
+  let answered = false;
   const unresolved = await unresolvedPins(sqlClient, pins);
   if (unresolved.length && await mayRequest()) {
-    result.pinsResolved = await resolvePins({ sqlClient, unresolved, lookupPins });
+    const lookup = await resolvePins({ sqlClient, unresolved, lookupPins });
+    result.pinsResolved = lookup.saved;
+    answered = lookup.answered;
   }
 
   const cap = Math.min(maxSearches, left - sent);
-  const firstTries = result.stoppedBecause === 'time' ? [] : inRunOrder(topics, await lastRunsOf(sqlClient));
+  const lastRuns = result.stoppedBecause === 'time' ? new Map() : await lastRunsOf(sqlClient);
+  const firstTries = result.stoppedBecause === 'time' ? [] : inRunOrder(topics, lastRuns);
   // The topics that got no answer, waiting for their second try.
   const secondTries = [];
   let tries = 0;
-  let answered = 0;
-  // The requests the run still has room for: what the cap leaves, and at most what the time left allows at the spacing alone.
-  const room = () => Math.min(cap - tries, spacingMs > 0 ? Math.floor((budgetMs - (now() - start)) / spacingMs) : Infinity);
+  let searchesAnswered = 0;
+  // The requests the run still has room for: what the cap leaves, and at most what the time left allows at the spacing, with
+  // ANSWER_ROOM_MS kept for each answer. Counted as if answers took no time, a first try could take the last start the time
+  // leaves, and its own answer then push the second try past the budget.
+  const room = () => Math.min(cap - tries, spacingMs > 0 ? Math.floor((budgetMs - (now() - start) - ANSWER_ROOM_MS) / spacingMs) : Infinity);
   for (;;) {
     // A second try waits until the first tries are done, or until the room left is only enough for the second tries.
     const second = secondTries.length > 0 && (firstTries.length === 0 || room() <= secondTries.length);
@@ -160,11 +174,21 @@ export async function refreshLibrary({
     const { results, status } = await search({ q: topic.q });
     if (status === 0) {
       if (second) result.noAnswer.push(topic.id);
-      else secondTries.push(topic);
+      else {
+        secondTries.push(topic);
+        // CourtListener answers a search it has run before far faster than one it has not (courtlistener.js). Until a search
+        // of the run has an answer, the topic run longest ago goes next, ahead of the topics never run, so that two slow
+        // topics never run at the head of the line cannot use up the night between them.
+        if (searchesAnswered === 0) {
+          const runBefore = firstTries.findIndex(other => Number.isFinite(lastRuns.get(other.id)));
+          if (runBefore > 0) firstTries.unshift(...firstTries.splice(runBefore, 1));
+        }
+      }
       continue;
     }
     if (status !== 200) throw new Error(`CourtListener answered ${status} to the topic search ${topic.id}; the run stopped`);
-    answered += 1;
+    answered = true;
+    searchesAnswered += 1;
     const records = (Array.isArray(results) ? results : []).slice(0, perTopic).map(recordFromResult).filter(Boolean);
     await saveFound(sqlClient, records, { caseType: topic.caseType, topicId: topic.id });
     await sqlClient`
@@ -177,7 +201,7 @@ export async function refreshLibrary({
   }
   // A topic whose second try found no room is set aside as well.
   result.noAnswer.push(...secondTries.map(topic => topic.id));
-  if (tries > 0 && answered === 0) {
+  if (tries > 0 && !answered) {
     throw new Error(`CourtListener answered 0 to every topic search of the run (${result.noAnswer.join(', ')}); the run failed`);
   }
 

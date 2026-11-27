@@ -294,11 +294,13 @@ test('with a retry the spacing and the time budget still hold: the second try ta
     return silent ? { status: 0, results: [] } : { status: 200, results: [] };
   };
   const result = await run({ sqlClient: db.sql, search, topics, clock, budgetMs: 180000, spacingMs: 13000 });
-  assert.deepEqual(asked, ['topic0', 'topic1', 'topic2', 'topic3', 'topic4', 'topic5', 'topic0']);
+  // The room left is counted with 5 s kept for each answer, so the second try is sent while one start more is surely left
+  // (at 163 s, with 25 s to go), and a first try still fits after it.
+  assert.deepEqual(asked, ['topic0', 'topic1', 'topic2', 'topic3', 'topic4', 'topic0', 'topic5']);
   assert.deepEqual([result.retried, result.noAnswer, result.stoppedBecause], [['auto-0'], [], 'time']);
   assert.deepEqual(clock.sleeps, Array(6).fill(13000), 'every request after the first waits the spacing');
   assert.ok(startedAt.every(at => at <= 180000), JSON.stringify(startedAt));
-  assert.equal(startedAt.at(-1), 178000, 'the second try starts as the last request inside the budget');
+  assert.deepEqual([startedAt.at(-2), startedAt.at(-1)], [163000, 178000], 'the second try, then the last request inside the budget');
 
   // When a slow search leaves no time for the second try, the topic is set aside and the night still ends well.
   const db2 = fakeDb();
@@ -396,6 +398,83 @@ test('an entry the lookup answered with another status resolves nothing', async 
     console.warn = realWarn;
   }
   assert.equal(db.pinned.length, 0);
+});
+
+// A search on a fake clock: each topic's tries take the times and get the statuses given, in turn (the last repeating), and
+// any other topic is answered in 2 s. Records what was asked and when each request started.
+function timedSearch(clock, plan = {}) {
+  const asked = [];
+  const startedAt = [];
+  const tries = new Map();
+  const search = async ({ q }) => {
+    asked.push(q);
+    startedAt.push(clock.t);
+    const k = tries.get(q) || 0;
+    tries.set(q, k + 1);
+    const list = plan[q] || [[2000, 200]];
+    const [ms, status] = list[Math.min(k, list.length - 1)];
+    clock.t += ms;
+    return { status, results: [] };
+  };
+  return { search, asked, startedAt };
+}
+const TIMES_OUT = [[90000, 0]];
+const SEVEN = { auto: Array.from({ length: 7 }, (_, i) => ({ id: `auto-${i}`, q: `topic${i}` })) };
+// auto-2 to auto-6 were run before, auto-2 longest ago; auto-0 and auto-1 never were.
+const RUN_BEFORE = Object.fromEntries([2, 3, 4, 5, 6].map(i => [`auto-${i}`, `2026-11-${10 + i}T22:00:00Z`]));
+
+test('two topics never run that get no answer do not fail the night: the topic run longest ago is asked next, before the other', async () => {
+  const db = fakeDb({ lastRuns: RUN_BEFORE });
+  const clock = fakeClock();
+  const { search, asked } = timedSearch(clock, { topic0: TIMES_OUT, topic1: TIMES_OUT });
+  const result = await run({ sqlClient: db.sql, search, topics: SEVEN, clock, budgetMs: 180000, spacingMs: 13000 });
+  assert.deepEqual(asked, ['topic0', 'topic2', 'topic1'], 'a search CourtListener has run before is asked before the second topic never run');
+  assert.deepEqual([result.searched, result.noAnswer, result.stoppedBecause], [['auto-2'], ['auto-0', 'auto-1'], 'time']);
+  assert.equal(db.deletes, 1, 'the night ends well');
+  // Once the run has an answer, a search with no answer moves nothing forward.
+  const db2 = fakeDb({ lastRuns: RUN_BEFORE });
+  const clock2 = fakeClock();
+  const second = timedSearch(clock2, { topic1: TIMES_OUT });
+  await run({ sqlClient: db2.sql, search: second.search, topics: SEVEN, clock: clock2, budgetMs: 180000, spacingMs: 13000 });
+  assert.deepEqual(second.asked.slice(0, 3), ['topic0', 'topic1', 'topic2']);
+});
+
+test('an outage still fails the night when topics run before are asked first', async () => {
+  const db = fakeDb({ lastRuns: RUN_BEFORE });
+  const { search, asked } = fakeSearch({ statusFor: Object.fromEntries(SEVEN.auto.map(topic => [topic.q, 0])) });
+  await assert.rejects(run({ sqlClient: db.sql, search, topics: SEVEN }), /^Error: CourtListener answered 0 to every topic search of the run \(.+\); the run failed$/);
+  assert.equal(asked.length, 10, 'every request the run may send');
+  assert.deepEqual(db.topicWrites, []);
+  assert.equal(db.deletes, 0);
+});
+
+test('the room left keeps a few seconds for each answer, so a second try is not lost to a first try that then leaves no time', async () => {
+  // The pins are looked up first, in 5 s; the first topic gets no answer in 90 s, then answers its second try in 2 s.
+  const db = fakeDb();
+  const clock = fakeClock();
+  const { search, asked } = timedSearch(clock, { topic0: [[90000, 0], [2000, 200]] });
+  const lookupPins = async ({ text }) => { clock.t += 5000; return lookupFromFixture().lookupPins({ text }); };
+  const topics = { auto: Array.from({ length: 12 }, (_, i) => ({ id: `auto-${i}`, q: `topic${i}` })) };
+  const result = await run({ sqlClient: db.sql, search, topics, clock, pins: PINS, lookupPins, budgetMs: 180000, spacingMs: 13000 });
+  assert.deepEqual(asked, ['topic0', 'topic1', 'topic2', 'topic3', 'topic0']);
+  assert.deepEqual([result.retried, result.noAnswer, result.stoppedBecause], [['auto-0'], [], 'time']);
+});
+
+test('a pin lookup that answers counts as an answer: a night whose one search gets no answer then ends well', async () => {
+  const db = fakeDb();
+  const { search } = fakeSearch({ statusFor: { alpha: 0 } });
+  const { lookupPins } = lookupFromFixture();
+  const result = await run({ sqlClient: db.sql, search, topics: { auto: [{ id: 'auto-a', q: 'alpha' }] }, pins: PINS, lookupPins, maxSearches: 1 });
+  assert.deepEqual([result.pinsResolved, result.noAnswer], [2, ['auto-a']]);
+  // A lookup that got no answer either is no answer: the night fails.
+  const realWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(run({ sqlClient: fakeDb().sql, search: fakeSearch({ statusFor: { alpha: 0 } }).search, topics: { auto: [{ id: 'auto-a', q: 'alpha' }] }, pins: PINS, lookupPins: async () => ({ status: 0, body: null }), maxSearches: 1 }),
+      /every topic search of the run \(auto-a\)/);
+  } finally {
+    console.warn = realWarn;
+  }
 });
 
 test('a cluster becomes a record: ids, citations, the Court of Appeals by its reporter, and nothing without an id or a name', () => {

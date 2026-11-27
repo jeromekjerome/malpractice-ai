@@ -6116,7 +6116,7 @@ test('the nightly job runs every step when one fails, records the run, and tells
     const run = sql.find(call => /^INSERT INTO job_runs/.test(call.query));
     assert.equal(String(run.params[1]), 'false');
     assert.match(String(run.params[2]), /decline overdue leads/);
-    assert.ok(logs.some(line => /1 step of the nightly job failed/.test(line)), 'the operator was not told');
+    assert.ok(logs.some(line => /the nightly job failed \(1 step\)/.test(line)), 'the operator was not told');
     assert.ok(logs.some(line => /daily summary/.test(line)), 'no daily summary was sent');
   } finally {
     await server.close();
@@ -6139,6 +6139,103 @@ async function withOperatorMail(fn) {
     nodemailer.createTransport = original;
   }
 }
+
+// The failure email of each job, rendered: what happened in plain words, whether visitors are affected, what to do and when
+// the job runs again, a link to /health/deep, and the error as the app gave it on the last line, keys withheld.
+async function failureEmail(job, failed) {
+  const { reportFailedSteps } = await import('../operations.js');
+  let mail;
+  await withOperatorMail(async sent => {
+    await reportFailedSteps(job, failed);
+    mail = sent[0];
+  });
+  return { subject: String(mail.subject), html: String(mail.html) };
+}
+const HEALTH_LINE = `<p>To see how each job's last run went, open <a href="${process.env.APP_URL}/health/deep">${process.env.APP_URL}/health/deep</a>: each job reads "ok" or "failed".</p>`;
+const debugLine = lines => `<p style="color:#666;font-size:12px">For whoever debugs it, the error as the app gave it: ${lines}</p>`;
+
+test('the case library failure email says in plain words that CourtListener gave no answer, that visitors are not affected, and when it runs again', async () => {
+  const { subject, html } = await failureEmail('case library', [{ step: 'refresh the case library', error: 'CourtListener answered 0 to every topic search of the run (surgical-error-wrong-site, misdiagnosis-radiology); the run failed' }]);
+  assert.equal(subject, 'NYCMalpractice.ai: the case library job failed');
+  assert.ok(html.includes('<p>The case library\'s nightly refresh failed. CourtListener gave no answer within 90 seconds to any of the night\'s searches, even on a second try where there was time: '
+    + 'the search for "malpractice wrong site surgery" (surgical-error-wrong-site) and the search for "radiologist malpractice misread film imaging" (misdiagnosis-radiology).</p>'), html);
+  assert.ok(html.includes('<p>Visitors are not affected. Replies keep using the decisions the library already holds, and a case type with fewer than 5 cleared decisions is searched on CourtListener live, as before.</p>'), html);
+  assert.ok(html.includes('<p>Nothing needs doing: CourtListener was slow or down. If it fails the same way again tomorrow night, CourtListener may be down for longer.</p>'), html);
+  assert.ok(html.includes('<p>The refresh runs again tomorrow night, and the topics it did not search are first in line.</p>'), html);
+  assert.ok(html.includes(HEALTH_LINE), html);
+  assert.ok(html.endsWith(`${debugLine('refresh the case library: CourtListener answered 0 to every topic search of the run (surgical-error-wrong-site, misdiagnosis-radiology); the run failed')}</div>`), html);
+  assert.doesNotMatch(html, /host's logs/);
+
+  // One search with no answer, a refusal of the rate and of the token, and CourtListener's own error.
+  const cases = [
+    ['CourtListener answered 0 to the topic search surgical-error-wrong-site; the run stopped', 'CourtListener gave no answer within 90 seconds to the search for "malpractice wrong site surgery" (surgical-error-wrong-site).'],
+    ['CourtListener answered 429 to the topic search medication-error-dosage; the run stopped', 'CourtListener refused: too many requests. It refused the search for "malpractice medication dosage overdose" (medication-error-dosage), and the refresh stopped there.'],
+    ['CourtListener answered 401 to the topic search medication-error-dosage; the run stopped', 'CourtListener refused the app\'s token at the search for "malpractice medication dosage overdose" (medication-error-dosage), and the refresh stopped there.'],
+    ['CourtListener answered 503 to the topic search gone-topic; the run stopped', 'CourtListener had an error of its own (status 503) at the search for gone-topic, and the refresh stopped there.'],
+  ];
+  for (const [error, said] of cases) {
+    const mail = await failureEmail('case library', [{ step: 'refresh the case library', error }]);
+    assert.ok(mail.html.includes(`<p>The case library's nightly refresh failed. ${said}</p>`), mail.html);
+  }
+  const refused = await failureEmail('case library', [{ step: 'refresh the case library', error: 'CourtListener answered 403 to the topic search medication-error-dosage; the run stopped' }]);
+  assert.ok(refused.html.includes('<p>Check COURTLISTENER_TOKEN in the deployment\'s settings on Vercel: until CourtListener takes it again, every refresh and screen fails.</p>'), refused.html);
+  const throttled = await failureEmail('case library', [{ step: 'refresh the case library', error: 'CourtListener answered 429 to the topic search medication-error-dosage; the run stopped' }]);
+  assert.ok(throttled.html.includes('<p>Nothing needs doing: the token\'s limits free up on their own. If it happens every night, the jobs ask more than the token allows.</p>'), throttled.html);
+});
+
+test('the screen failure email names the decision, says visitors are not affected, and that the screen tries again at its next run', async () => {
+  const { subject, html } = await failureEmail('screen', [{ step: 'screen the case library', error: 'CourtListener answered 503 to the screen of 5685956; the run stopped' }]);
+  assert.equal(subject, 'NYCMalpractice.ai: the screen job failed');
+  assert.ok(html.includes('<p>The nightly screen of the case library failed. CourtListener had an error of its own (status 503) while the screen asked about decision 5685956, and the screen stopped there.</p>'), html);
+  assert.ok(html.includes('<p>Visitors are not affected. A decision the screen has not cleared is never offered to replies from the library; replies keep using the decisions already cleared, or search CourtListener live.</p>'), html);
+  assert.ok(html.includes('<p>Nothing needs doing: the error was on CourtListener\'s side.</p>'), html);
+  assert.ok(html.includes('<p>The screen runs twice a night, an hour apart, and tries again at its next run.</p>'), html);
+  assert.ok(html.includes(HEALTH_LINE), html);
+  const silent = await failureEmail('screen', [{ step: 'screen the case library', error: 'CourtListener answered 0 to every screen request of the run (5685956, 5685957); the run failed' }]);
+  assert.ok(silent.html.includes('<p>The nightly screen of the case library failed. CourtListener gave no answer within 45 seconds to any of the screen\'s requests (decisions 5685956 and 5685957).</p>'), silent.html);
+  const missing = await failureEmail('screen', [{ step: 'screen the case library', error: 'COURTLISTENER_TOKEN is not set in this deployment' }]);
+  assert.ok(missing.html.includes('<p>The nightly screen of the case library failed. The setting COURTLISTENER_TOKEN is missing from the deployment, so the job could not start.</p>'), missing.html);
+  assert.ok(missing.html.includes('<p>Set COURTLISTENER_TOKEN in the deployment\'s settings on Vercel, then redeploy.</p>'), missing.html);
+});
+
+test('the statute watch failure email says nothing a visitor reads changes, and what a change missed means', async () => {
+  const { subject, html } = await failureEmail('statute watch', [{ step: 'check the watched statutes', error: 'no watched section or bill could be read (status 403)' }]);
+  assert.equal(subject, 'NYCMalpractice.ai: the statute watch job failed');
+  assert.ok(html.includes('<p>The nightly statute watch failed. No watched section or bill could be read from the Senate\'s Open Legislation API (status 403).</p>'), html);
+  assert.ok(html.includes('<p>Visitors are not affected: nothing a visitor reads changes until you approve it. Until the watch runs again, though, a change to a watched statute goes unnoticed.</p>'), html);
+  assert.ok(html.includes('<p>If the reason is a refusal (status 401 or 403), check NYSENATE_API_KEY in the deployment\'s settings on Vercel. Otherwise nothing needs doing.</p>'), html);
+  assert.ok(html.includes('<p>The watch runs again tomorrow night.</p>'), html);
+});
+
+test('the nightly failure email says, for each failed step, what it means for visitors and firms, and keeps every raw error, keys withheld, on its last line', async () => {
+  const { subject, html } = await failureEmail('nightly', [
+    { step: 'close expired auctions', error: 'connection refused <b>sk-live-0123456789abcdef</b>' },
+    { step: 'delete old conversations', error: 'timeout' },
+  ]);
+  assert.equal(subject, 'NYCMalpractice.ai: the nightly job failed (2 steps)');
+  assert.ok(html.includes('<p>2 of the nightly job\'s steps failed; the others ran.</p>'), html);
+  assert.ok(html.includes('<h3>Close expired auctions</h3><p>It stopped with an error, given at the end of this email.</p>'
+    + '<p>An auction past its closing time stays open until someone next opens the site, which closes it, or until tomorrow night, so its winning firm may wait for the lead.</p>'
+    + '<p>Nothing needs doing tonight. If it fails again tomorrow night, it needs a look.</p>'), html);
+  assert.ok(html.includes('<h3>Delete old conversations</h3><p>It stopped with an error, given at the end of this email.</p>'
+    + '<p>Visitors are not affected, but conversations older than 90 days are kept until the step runs well, longer than the privacy policy says.</p>'
+    + '<p>Nothing needs doing tonight. If it fails again tomorrow night, it needs a look: the privacy policy promises the deletion.</p>'), html);
+  assert.ok(html.includes('<p>The nightly job runs again tomorrow night.</p>'), html);
+  assert.ok(html.includes(HEALTH_LINE), html);
+  assert.ok(html.includes(debugLine('close expired auctions: connection refused &lt;b&gt;[key withheld]&lt;/b&gt;; delete old conversations: timeout')), html);
+  assert.doesNotMatch(html, /sk-live|<b>/);
+  // Every step of the nightly list has its own line on what its failure means.
+  const steps = ['delete old conversations', 'delete old lead records', 'back up business records offsite', 'close expired auctions', 'report stuck auctions',
+    'decline overdue leads', 'recount declines', 'watch the model lists of the providers'];
+  assert.deepEqual([...readFileSync(new URL('../server.js', import.meta.url), 'utf8').matchAll(/^ {6}\['([a-z ]+)', \w+\],$/gm)].map(match => match[1]), steps, 'the list of nightly steps in server.js');
+  for (const step of steps) {
+    const mail = await failureEmail('nightly', [{ step, error: 'x' }]);
+    assert.equal(mail.subject, 'NYCMalpractice.ai: the nightly job failed (1 step)');
+    assert.doesNotMatch(mail.html, /one of the nightly steps; see the error/, step);
+  }
+  const later = await failureEmail('nightly', [{ step: 'a step added later', error: 'x' }]);
+  assert.ok(later.html.includes('<p>It is one of the nightly steps; see the error at the end of this email.</p>'), later.html);
+});
 
 test('the daily summary names the models the override let in that have no measurement on record, who used it and when, for as long as one has none', async () => {
   const { sendDailyDigest } = await import('../operations.js');
@@ -8014,7 +8111,7 @@ test('a failed statute-watch step answers 500 and emails the failed step', async
       assert.equal(String(world.jobRuns[0][1]), 'false');
       assert.match(String(world.jobRuns[0][2]), /NYSENATE_API_KEY is not set in this deployment/);
       assert.equal(sent.length, 1);
-      assert.match(sent[0].subject, /1 step of the statute watch job failed/);
+      assert.equal(sent[0].subject, 'NYCMalpractice.ai: the statute watch job failed');
       assert.match(sent[0].html, /check the watched statutes/);
     })));
   } finally {
@@ -8370,7 +8467,7 @@ test('the library route answers 500 and emails the failed step when the token is
       assert.equal(String(world.jobRuns[0][1]), 'false');
       assert.match(String(world.jobRuns[0][2]), /COURTLISTENER_TOKEN is not set in this deployment/);
       assert.equal(sent.length, 1);
-      assert.match(sent[0].subject, /1 step of the case library job failed/);
+      assert.equal(sent[0].subject, 'NYCMalpractice.ai: the case library job failed');
     })));
   } finally {
     await server.close();
@@ -8513,7 +8610,7 @@ test('the screen route answers 500 and emails the failed step when the token is 
       assert.equal(String(world.jobRuns[0][1]), 'false');
       assert.match(String(world.jobRuns[0][2]), /COURTLISTENER_TOKEN is not set in this deployment/);
       assert.equal(sent.length, 1);
-      assert.match(sent[0].subject, /1 step of the screen job failed/);
+      assert.equal(sent[0].subject, 'NYCMalpractice.ai: the screen job failed');
     })));
   } finally {
     await server.close();
@@ -8539,6 +8636,28 @@ test('a refused or unanswered screen question makes the route answer 500 and rec
         assert.equal(sent.length, 1, 'only the failed step is emailed');
       })));
     }
+  } finally {
+    await server.close();
+  }
+});
+
+test('a screen night where no question gets an answer answers 500, gives the decision only its try time, and emails the failure in plain words', async () => {
+  const world = screenWorld({ searchStatus: 0 });
+  const server = await startServer(app);
+  try {
+    await capturingLogs(() => withScreenSettings({}, () => withOperatorMail(async sent => {
+      await withOutboundHttp(world.handler, async () => {
+        const response = await runScreen(server.baseUrl);
+        assert.equal(response.status, 500);
+        assert.deepEqual((await response.json()).failed, ['screen the case library']);
+      });
+      assert.match(String(world.jobRuns[0][2]), /CourtListener answered 0 to every screen request of the run \(5685956\); the run failed/);
+      assert.equal(world.sql.filter(call => /^UPDATE case_library SET screen_tried_at/.test(call.query)).length, 1, 'the try time');
+      assert.ok(!world.sql.some(call => /^UPDATE case_library SET screen_state/.test(call.query)), 'the decision changed its state');
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].subject, 'NYCMalpractice.ai: the screen job failed');
+      assert.ok(String(sent[0].html).includes('CourtListener gave no answer within 45 seconds to any of the screen\'s requests (decision 5685956).'), sent[0].html);
+    })));
   } finally {
     await server.close();
   }

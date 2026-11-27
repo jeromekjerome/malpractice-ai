@@ -17,6 +17,7 @@ import { readLawFile } from './law-file.js';
 import { statuteWatchSummary } from './statute-watch.js';
 import { libraryCounts } from './case-library.js';
 import { usageToday, readAllowance } from './courtlistener-usage.js';
+import { LIBRARY_TIMEOUT_MS, SCREEN_TIMEOUT_MS } from './courtlistener.js';
 import { CASE_TOPICS } from './case-topics.js';
 
 const sql = neon(process.env.DATABASE_URL);
@@ -341,11 +342,157 @@ export async function recordJobRun(job, failed) {
   await sql`DELETE FROM job_runs WHERE ran_at < NOW() - INTERVAL '90 days'`;
 }
 
+// ─── The email about a failed job ─────────────────────────────────────────────
+// Written for an owner who is not an engineer: what happened in plain words, whether visitors are affected, whether anything
+// needs doing, and when the job runs again. The host keeps about an hour of logs, so the email points to /health/deep, and
+// the error as the app gave it goes on the last line, keys withheld, for whoever debugs it.
+
+// Each job's own lines. A nightly step says for itself what its failure means (NIGHTLY_STEPS).
+const JOBS = {
+  'case library': {
+    opening: "The case library's nightly refresh failed.",
+    visitors: 'Visitors are not affected. Replies keep using the decisions the library already holds, and a case type with fewer than 5 cleared decisions is searched on CourtListener live, as before.',
+    again: 'The refresh runs again tomorrow night, and the topics it did not search are first in line.',
+  },
+  screen: {
+    opening: 'The nightly screen of the case library failed.',
+    visitors: 'Visitors are not affected. A decision the screen has not cleared is never offered to replies from the library; replies keep using the decisions already cleared, or search CourtListener live.',
+    again: 'The screen runs twice a night, an hour apart, and tries again at its next run.',
+  },
+  'statute watch': {
+    opening: 'The nightly statute watch failed.',
+    visitors: 'Visitors are not affected: nothing a visitor reads changes until you approve it. Until the watch runs again, though, a change to a watched statute goes unnoticed.',
+    again: 'The watch runs again tomorrow night.',
+  },
+  nightly: { again: 'The nightly job runs again tomorrow night.' },
+};
+
+// What the failure of each step of the nightly job (server.js) means, and what to do when it is not the usual.
+const LOOK_TOMORROW = 'Nothing needs doing tonight. If it fails again tomorrow night, it needs a look.';
+const PRIVACY_LOOK = 'Nothing needs doing tonight. If it fails again tomorrow night, it needs a look: the privacy policy promises the deletion.';
+const NIGHTLY_STEPS = {
+  'delete old conversations': {
+    means: 'Visitors are not affected, but conversations older than 90 days are kept until the step runs well, longer than the privacy policy says.',
+    todo: PRIVACY_LOOK,
+  },
+  'delete old lead records': {
+    means: 'Visitors are not affected, but lead records older than 3 years are kept until the step runs well, longer than the privacy policy says.',
+    todo: PRIVACY_LOOK,
+  },
+  'back up business records offsite': {
+    means: "Visitors are not affected. Tonight's encrypted copy of the firms, leads, auctions and bids was not made offsite; the last copy made stays.",
+  },
+  // An auction past its time is also closed by the next request from a firm or a visitor (sweepExpiredAuctions in server.js).
+  'close expired auctions': {
+    means: 'An auction past its closing time stays open until someone next opens the site, which closes it, or until tomorrow night, so its winning firm may wait for the lead.',
+  },
+  'report stuck auctions': {
+    means: 'Visitors are not affected. You were not told tonight about any auction stuck while closing (a charge Stripe did not confirm, or a win not recorded).',
+  },
+  'decline overdue leads': {
+    means: 'A lead a firm has not answered within 3 days stays with that firm until the step runs, instead of being offered to other firms, so its client waits longer to hear from a firm.',
+  },
+  'recount declines': {
+    means: "Visitors are not affected. A firm's declines older than 30 days may still count toward its refunds and suspension until the counts are redone.",
+  },
+  'watch the model lists of the providers': {
+    means: "Visitors are not affected. Tonight's look at the AI providers' lists of models did not finish; a retirement reminder due tonight, if any, was not sent.",
+  },
+};
+
+const seconds = ms => `${Math.round(ms / 1000)} seconds`;
+const listed = items => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items.at(-1)}` : items[0] ?? '');
+const ALL_TOPICS = new Map(Object.values(CASE_TOPICS).flat().map(topic => [topic.id, topic.q]));
+// A topic search as the owner reads it: its words and its id, or the id alone for a topic no longer listed.
+const searchFor = id => (ALL_TOPICS.has(id) ? `the search for "${escapeHtml(ALL_TOPICS.get(id))}" (${escapeHtml(id)})` : `the search for ${escapeHtml(id)}`);
+const decisions = ids => `decision${ids.length === 1 ? '' : 's'} ${listed(ids.map(escapeHtml))}`;
+
+// A CourtListener answer by its status, as the rest of a sentence about where it came: "refused: too many requests ...".
+function courtListenerSaid(status, where, stopped) {
+  if (status === 0) return `CourtListener gave no answer within ${where.limit} to ${where.what}.`;
+  if (status === 429) return `CourtListener refused: too many requests. It refused ${where.what}, and ${stopped} stopped there.`;
+  if (status === 401 || status === 403) return `CourtListener refused the app's token ${where.at}, and ${stopped} stopped there.`;
+  if (status >= 500 && status <= 599) return `CourtListener had an error of its own (status ${status}) ${where.at}, and ${stopped} stopped there.`;
+  return `CourtListener answered ${where.what} with status ${status}, which the app cannot use, and ${stopped} stopped there.`;
+}
+
+// What a failed step's error says, in plain words, with what to do about it when that is more than the usual. The errors are
+// those of library-refresh.js, case-screen.js, statute-watch.js and the job routes in server.js.
+function plainFailure(error) {
+  const text = String(error ?? '');
+  let match = /CourtListener answered 0 to every topic search of the run \(([^)]*)\)/.exec(text);
+  if (match) {
+    return { said: `CourtListener gave no answer within ${seconds(LIBRARY_TIMEOUT_MS)} to any of the night's searches, even on a second try where there was time: ${listed(match[1].split(', ').map(searchFor))}.`, status: 0 };
+  }
+  match = /CourtListener answered (\d+) to the topic search (\S+); the run stopped/.exec(text);
+  if (match) {
+    const status = Number(match[1]);
+    const where = { limit: seconds(LIBRARY_TIMEOUT_MS), what: searchFor(match[2]), at: `at ${searchFor(match[2])}` };
+    return { said: courtListenerSaid(status, where, 'the refresh'), status };
+  }
+  match = /CourtListener answered 0 to every screen request of the run \(([^)]*)\)/.exec(text);
+  if (match) return { said: `CourtListener gave no answer within ${seconds(SCREEN_TIMEOUT_MS)} to any of the screen's requests (${decisions(match[1].split(', '))}).`, status: 0 };
+  match = /CourtListener answered (\d+) to the screen of (\d+); the run stopped/.exec(text);
+  if (match) {
+    const status = Number(match[1]);
+    const where = { limit: seconds(SCREEN_TIMEOUT_MS), what: `the screen's question about decision ${match[2]}`, at: `while the screen asked about decision ${match[2]}` };
+    return { said: courtListenerSaid(status, where, 'the screen'), status };
+  }
+  match = /^([A-Z][A-Z0-9_]+) is not set in this deployment/.exec(text);
+  if (match) return { said: `The setting ${match[1]} is missing from the deployment, so the job could not start.`, todo: `Set ${match[1]} in the deployment's settings on Vercel, then redeploy.` };
+  match = /no watched section or bill could be read \((.*)\)$/.exec(text);
+  if (match) {
+    return {
+      said: `No watched section or bill could be read from the Senate's Open Legislation API (${escapeHtml(withoutKeys(match[1]))}).`,
+      todo: "If the reason is a refusal (status 401 or 403), check NYSENATE_API_KEY in the deployment's settings on Vercel. Otherwise nothing needs doing.",
+    };
+  }
+  return { said: 'It stopped with an error, given at the end of this email.' };
+}
+
+// What to do after a CourtListener answer, by its status.
+function courtListenerTodo(status) {
+  if (status === 0) return 'Nothing needs doing: CourtListener was slow or down. If it fails the same way again tomorrow night, CourtListener may be down for longer.';
+  if (status === 429) return "Nothing needs doing: the token's limits free up on their own. If it happens every night, the jobs ask more than the token allows.";
+  if (status === 401 || status === 403) return "Check COURTLISTENER_TOKEN in the deployment's settings on Vercel: until CourtListener takes it again, every refresh and screen fails.";
+  if (status >= 500 && status <= 599) return "Nothing needs doing: the error was on CourtListener's side.";
+  return LOOK_TOMORROW;
+}
+
+const sentence = text => `<p>${text}</p>`;
+const capitalized = text => text.charAt(0).toUpperCase() + text.slice(1);
+
+/**
+ * Emails the owner about a job's failed steps. The subject names the job and says it failed; the body says, for each step, what
+ * happened in plain words, whether visitors are affected and what to do, then when the job runs again and where to see each
+ * job's last run, and last the errors as the app gave them, keys withheld.
+ * @param {string} job  'nightly', 'statute watch', 'case library' or 'screen'
+ * @param {{ step: string, error: string }[]} failed  runSteps' failed steps
+ */
 export async function reportFailedSteps(job, failed) {
   if (!failed.length) return;
-  await notifyOperator(`${SITE}: ${failed.length} step${failed.length === 1 ? '' : 's'} of the ${job} job failed`,
-    `<p>These steps failed; the others ran:</p><ul>${failed.map(f => `<li><strong>${escapeHtml(f.step)}</strong>: ${escapeHtml(f.error)}</li>`).join('')}</ul>` +
-    '<p>They run again tomorrow. Check the host\'s logs for details.</p>');
+  const own = JOBS[job] || {};
+  const nightly = job === 'nightly' || !own.opening;
+  const parts = [];
+  if (nightly) parts.push(sentence(`${failed.length} of the ${escapeHtml(job)} job's steps failed; the others ran.`));
+  for (const { step, error } of failed) {
+    const plain = plainFailure(error);
+    const todo = plain.todo ?? (plain.status !== undefined ? courtListenerTodo(plain.status) : null);
+    if (nightly) {
+      const meaning = NIGHTLY_STEPS[step];
+      parts.push(`<h3>${escapeHtml(capitalized(String(step)))}</h3>`, sentence(plain.said),
+        sentence(meaning?.means ?? 'It is one of the nightly steps; see the error at the end of this email.'), sentence(todo ?? meaning?.todo ?? LOOK_TOMORROW));
+    } else {
+      parts.push(sentence(`${own.opening} ${plain.said}`), sentence(own.visitors), sentence(todo ?? LOOK_TOMORROW));
+    }
+  }
+  if (own.again) parts.push(sentence(own.again));
+  const health = `${escapeHtml(APP_URL)}/health/deep`;
+  parts.push(sentence(`To see how each job's last run went, open <a href="${health}">${health}</a>: each job reads "ok" or "failed".`));
+  const raw = failed.map(({ step, error }) => `${escapeHtml(step)}: ${escapeHtml(withoutKeys(error))}`).join('; ');
+  parts.push(`<p style="color:#666;font-size:12px">For whoever debugs it, the error as the app gave it: ${raw}</p>`);
+  const subject = `${SITE}: the ${job} job failed${job === 'nightly' ? ` (${failed.length} step${failed.length === 1 ? '' : 's'})` : ''}`;
+  await notifyOperator(subject, `<div style="font-family:sans-serif;max-width:600px">${parts.join('')}</div>`);
 }
 
 // A summary of the last day for the operator, sent with the nightly job (DAILY_DIGEST=off stops it). It also shows

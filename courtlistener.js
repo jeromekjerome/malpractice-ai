@@ -249,7 +249,7 @@ export async function lookupCitations({ text, fetchImpl = fetch } = {}) {
 // job `screen` before it calls this, so it is not counted here. Returns { status, body }; never throws. Its timeout goes with
 // the screen's time budget (case-screen.js): the last request starts by 235 s and so ends by 280 s, inside the 300 s of the
 // jobs function (api/jobs.js). A heavily cited decision's question took 25 s when the words were tuned.
-const SCREEN_TIMEOUT_MS = 45_000;
+export const SCREEN_TIMEOUT_MS = 45_000;
 export async function searchForScreen({ params, fetchImpl = fetch } = {}) {
   try {
     const res = await fetchImpl(`${CL_BASE}/search/?${new URLSearchParams(params || {})}`, { headers: getHeaders(), signal: AbortSignal.timeout(SCREEN_TIMEOUT_MS) });

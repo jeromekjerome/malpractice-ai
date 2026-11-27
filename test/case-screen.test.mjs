@@ -577,8 +577,8 @@ test('a 429 on a decision being screened again leaves it clear with its old date
   assert.deepEqual([db.row(row.cluster_id).screen_state, db.row(row.cluster_id).screened_at, db.row(row.cluster_id).screen_tried_at], ['clear', old, old]);
 });
 
-test('no answer or a 5xx on a decision whose last try did not fail records its try, stops the run and throws, holding nothing', async () => {
-  for (const status of [0, 503]) {
+test('a 5xx on a decision whose last try did not fail records its try, stops the run and throws, holding nothing', async () => {
+  for (const status of [503, 500]) {
     const first = courtOfAppeals();
     const second = courtOfAppeals();
     const third = courtOfAppeals();
@@ -601,6 +601,55 @@ test('no answer or a 5xx on a decision whose last try did not fail records its t
     assert.deepEqual([db2.row(again.cluster_id).screen_state, db2.row(again.cluster_id).screened_at], ['clear', ago(40)]);
     assert.equal(db2.row(again.cluster_id).screen_tried_at, new Date(NIGHT).toISOString());
   }
+});
+
+test('no answer on a decision whose last try did not fail records its try, holds nothing, and the run goes on', async () => {
+  const first = courtOfAppeals();
+  const silent = courtOfAppeals();
+  const third = courtOfAppeals();
+  const again = courtOfAppeals({ screen_state: 'clear', screened_at: ago(40), screen_tried_at: ago(40) });
+  const db = fakeLibrary([first, silent, third, again]);
+  const { search, asked } = answering(db, params => (params.q.includes(`(${silent.opinion_id})`) || params.q.includes(`(${again.opinion_id})`) ? { status: 0, body: null } : { status: 200, body: { count: 0, results: [] } }));
+  const { result, mail } = await run({ db, search });
+  assert.equal(asked.length, 4, 'the decisions after it were screened');
+  assert.deepEqual(result, { screened: 2, cleared: 2, held: 0, requests: 4, notifyFailed: 0, stoppedBecause: null });
+  const tried = db.row(silent.cluster_id);
+  assert.deepEqual([tried.screen_state, tried.screened_at, tried.hold], ['unscreened', null, null]);
+  assert.equal(tried.screen_tried_at, new Date(NIGHT + 13000).toISOString());
+  assert.deepEqual([first, third].map(row => db.row(row.cluster_id).screen_state), ['clear', 'clear']);
+  // A clear decision screened again keeps its old date; only its try time is new.
+  assert.deepEqual([db.row(again.cluster_id).screen_state, db.row(again.cluster_id).screened_at], ['clear', ago(40)]);
+  assert.equal(db.row(again.cluster_id).screen_tried_at, new Date(NIGHT + 3 * 13000).toISOString());
+  assert.equal(mail.sent.length, 0);
+});
+
+test('a run where no request gets an answer fails: each decision asked gets its try time, and the first whose last try failed is held', async () => {
+  const fresh = courtOfAppeals();
+  const repeat = courtOfAppeals({ screen_tried_at: ago(1) });
+  const other = courtOfAppeals();
+  const db = fakeLibrary([fresh, other, repeat]);
+  const { search, asked } = answering(db, () => ({ status: 0, body: null }));
+  const mail = fakeMail();
+  await rejectsQuietly(run({ db, search, mail }), new RegExp(`^Error: CourtListener answered 0 to every screen request of the run \\(${fresh.cluster_id}, ${other.cluster_id}, ${repeat.cluster_id}\\); the run failed$`));
+  assert.equal(asked.length, 3, 'every decision due was asked');
+  assert.deepEqual([fresh, other].map(row => db.row(row.cluster_id).screen_state), ['unscreened', 'unscreened']);
+  assert.ok([fresh, other].every(row => db.row(row.cluster_id).screen_tried_at), 'each has its try time');
+  assert.deepEqual([db.row(repeat.cluster_id).screen_state, db.row(repeat.cluster_id).hold.status], ['held', 0]);
+  assert.equal(mail.sent.length, 1);
+});
+
+test('with one decision held as unreadable, another whose last try failed and that gets no answer only gets its try time, and the run goes on', async () => {
+  const first = courtOfAppeals({ screen_tried_at: ago(2) });
+  const second = courtOfAppeals({ screen_tried_at: ago(1) });
+  const answered = courtOfAppeals();
+  const db = fakeLibrary([answered, first, second]);
+  const { search, asked } = answering(db, params => (params.q.includes(`(${answered.opinion_id})`) ? { status: 200, body: { count: 0, results: [] } } : { status: 0, body: null }));
+  const { result, mail } = await run({ db, search });
+  assert.equal(asked.length, 3);
+  assert.deepEqual(result, { screened: 2, cleared: 1, held: 1, requests: 3, notifyFailed: 0, stoppedBecause: null });
+  assert.deepEqual([answered, first, second].map(row => db.row(row.cluster_id).screen_state), ['clear', 'held', 'unscreened']);
+  assert.equal(db.row(second.cluster_id).screen_tried_at, new Date(NIGHT + 2 * 13000).toISOString());
+  assert.equal(mail.sent.length, 1);
 });
 
 test('no answer or a 5xx on a decision whose last try failed holds it as unreadable, emails the owner once, and the run goes on', async () => {
@@ -693,9 +742,10 @@ test('an answer the screen cannot read holds the decision as unreadable, emails 
 
 test('the email about an unreadable hold says the owner can screen it again or ban it, and reads status 0 as no answer', async () => {
   for (const [status, said] of [[0, '(no answer)'], [503, '(status 503)'], [400, '(status 400)']]) {
+    // A decision after it is answered, so that a run whose one other request got no answer still ends well.
     const repeat = courtOfAppeals({ screen_tried_at: ago(1) });
-    const db = fakeLibrary([repeat]);
-    const { mail } = await run({ db, search: answering(db, () => ({ status, body: null })).search });
+    const db = fakeLibrary([repeat, courtOfAppeals({ screen_tried_at: ago(0.5) })]);
+    const { mail } = await run({ db, search: answering(db, params => (params.q.includes(`(${repeat.opinion_id})`) ? { status, body: null } : { status: 200, body: { count: 0, results: [] } })).search });
     const { html } = mail.sent[0];
     assert.ok(html.includes(`The screen could not read CourtListener's answer for it ${said}.`), html);
     assert.ok(html.includes('It waits for you on the admin page, where you can screen it again or ban it.</p>'), html);

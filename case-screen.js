@@ -127,8 +127,10 @@ const hasMark = hit => /<mark>/i.test(snippetOf(hit));
 // - failed: no answer at all (status 0) or a 5xx;
 // - results: a 200 with a list of results, and `more` when the answer names a next page;
 // - unreadable: anything else, a question this decision's screen could not get answered.
+// An answer with no readable status counts as no answer.
+const statusOf = answer => (Number.isFinite(Number(answer?.status)) ? Number(answer.status) : 0);
 function readAnswer(answer) {
-  const status = Number.isFinite(Number(answer?.status)) ? Number(answer.status) : 0;
+  const status = statusOf(answer);
   if ([401, 403, 429].includes(status)) return { refused: status };
   if (status === 0 || (status >= 500 && status <= 599)) return { failed: status };
   if (status === 200 && Array.isArray(answer?.body?.results)) return { results: answer.body.results, more: Boolean(answer.body.next) };
@@ -220,14 +222,19 @@ async function tellOwner(notify, row, hold, site) {
 }
 
 /**
- * One night's screen. Returns what it did. It throws, keeping every row written before, when CourtListener:
- * - refuses the token or the rate (401, 403, 429): that decision is left exactly as it was;
- * - gives no answer or a 5xx: that decision gets its try time. But a decision whose last try failed too is held as
- *   unreadable instead and the run goes on, so a decision that never answers leaves the queue;
+ * One night's screen. Returns what it did. When CourtListener:
+ * - refuses the token or the rate (401, 403, 429): the run throws at once, and that decision is left exactly as it was;
+ * - gives no answer (status 0: none within the time limit, or a network error): that decision gets its try time and the run
+ *   goes on. A decision whose last try failed too is held as unreadable instead, so a decision that never answers leaves
+ *   the queue;
+ * - gives a 5xx: that decision gets its try time and the run throws. A decision whose last try failed too is held as
+ *   unreadable instead and the run goes on;
  * - gives any other answer the screen cannot read (another 4xx, or a 200 with no results): the decision is held as unreadable
  *   and the run goes on.
- * At most one decision a run is held as unreadable, whatever the answer was: the next one gets its try time and the run
- * stops, so a run that meets an outage, or a change at CourtListener that every question meets, still stops.
+ * At most one decision a run is held as unreadable, whatever the answer was. After it, a decision with no answer only gets
+ * its try time, and one with any other answer the screen cannot read gets its try time and the run throws, so a change at
+ * CourtListener that every question meets still stops the run. A run in which no request got an answer at all, an outage,
+ * throws at its end. Every row written before a throw is kept.
  *
  * @param {Function} options.search     search({ params }) => { status, body } (searchForScreen in courtlistener.js); never throws
  * @param {Function} options.allowance  () => { day, hour, minute } | null, read once (readAllowance)
@@ -260,16 +267,21 @@ export async function screenDecisions({
 
   // Every request after the first waits the spacing; none is sent when the spacing would carry the run past its time. Each is
   // counted before it is sent, as CourtListener counts it.
+  let answered = 0;
   const ask = async params => {
     if (now() - start + spacingMs > budgetMs) return TIME_UP;
     if (result.requests > 0) await sleep(spacingMs);
     await countRequests(sqlClient, 'screen', 1);
     result.requests += 1;
-    return search({ params });
+    const answer = await search({ params });
+    if (statusOf(answer) !== 0) answered += 1;
+    return answer;
   };
 
   // Whether a decision has been held as unreadable in this run: one may be, whatever the answer was.
   let unreadableHeld = false;
+  // The decisions that got no answer, for the error of a run in which none did.
+  const unanswered = [];
   for (const row of rows) {
     const questions = screenQuestions(row);
     // A decision is started only when all its questions fit under the cap.
@@ -284,10 +296,17 @@ export async function screenDecisions({
     }
     const at = new Date(now()).toISOString();
     if (found.refused !== undefined) throw stopped(found.refused, row);
-    // No answer or a 5xx on a decision whose last try did not fail, or a second unreadable answer in the run: the decision
-    // gets its try time and the run stops. The first unreadable answer of the run holds its decision and the run goes on.
+    // No answer, on a decision whose last try did not fail or after the run's one unreadable hold: the decision gets its try
+    // time and the run goes on. A 5xx on a decision whose last try did not fail, or a second unreadable answer in the run: the
+    // decision gets its try time and the run stops. The first unreadable answer of the run holds its decision and the run
+    // goes on.
     const unreadable = found.failed ?? found.unreadable;
+    if (found.failed === 0) unanswered.push(row.cluster_id);
     if (unreadable !== undefined) {
+      if (found.failed === 0 && (!row.last_try_failed || unreadableHeld)) {
+        await recordTried(sqlClient, row.cluster_id, at);
+        continue;
+      }
       if ((found.failed !== undefined && !row.last_try_failed) || unreadableHeld) {
         await recordTried(sqlClient, row.cluster_id, at);
         throw stopped(unreadable, row);
@@ -305,6 +324,9 @@ export async function screenDecisions({
     if (!(await recordHeld(sqlClient, row.cluster_id, hold, at))) continue;
     result.held += 1;
     if (!(await tellOwner(notify, row, hold, site))) result.notifyFailed += 1;
+  }
+  if (result.requests > 0 && answered === 0) {
+    throw new Error(`CourtListener answered 0 to every screen request of the run (${unanswered.join(', ')}); the run failed`);
   }
   if (!result.stoppedBecause && rows.length >= cap) result.stoppedBecause = capReason;
   return result;

@@ -6160,7 +6160,7 @@ const SAVED_ONLY = 'for a case type with fewer than 5 cleared decisions they use
 const VISITORS = {
   down: `<p>If CourtListener is down, visitors are affected too: replies' live searches fail, so ${SAVED_ONLY}</p>`,
   refused: `<p>Visitors are affected until the token is fixed: replies search CourtListener with the same token, so ${SAVED_ONLY}</p>`,
-  throttled: `<p>Visitors may be affected until the hour's limit frees up: replies search CourtListener with the same token, so their searches may be refused too. Then, ${SAVED_ONLY}</p>`,
+  throttled: `<p>Visitors may be affected while the token's limits are spent: replies search CourtListener with the same token, so their searches may be refused too. Then, ${SAVED_ONLY}</p>`,
   noToken: '<p>Visitors are affected: the citation check in replies runs only with the token set, so the citations in replies go unchecked until it is set.</p>',
   library: '<p>Visitors are not affected. Replies keep using the decisions the library already holds, and a case type with fewer than 5 cleared decisions is searched on CourtListener live, as before.</p>',
 };
@@ -6242,6 +6242,14 @@ test('an error that says the database lacks a table, or names a setting to fix, 
   assert.ok(backupKey.html.includes('<p>Correct BACKUP_ENCRYPTION_KEY in the deployment\'s settings on Vercel, then redeploy.</p>'), backupKey.html);
   const prefix = await failureEmail('nightly', [{ step: 'back up business records offsite', error: 'BACKUP_PREFIX must be a safe object-key prefix.' }]);
   assert.ok(prefix.html.includes('<p>The setting BACKUP_PREFIX is not valid: it must be a safe object-key prefix.</p>'), prefix.html);
+  // Only Postgres's own words for a missing table or column send the owner to setup-db; the backup's storage saying a bucket
+  // does not exist is no database matter.
+  const bucket = await failureEmail('nightly', [{ step: 'back up business records offsite', error: 'The specified bucket does not exist' }]);
+  assert.ok(bucket.html.includes('<h3>Back up business records offsite</h3><p>It stopped with an error, given at the end of this email.</p>'), bucket.html);
+  assert.ok(bucket.html.includes(FALLBACK_TODO), bucket.html);
+  assert.doesNotMatch(bucket.html, /setup-db/);
+  const ofRelation = await failureEmail('nightly', [{ step: 'decline overdue leads', error: 'column "decline_reason" of relation "leads" does not exist' }]);
+  assert.ok(ofRelation.html.includes('<p>Run npm run setup-db against the production database (or ask Claude to).</p>'), ofRelation.html);
   const unknown = await failureEmail('statute watch', [{ step: 'check the watched statutes', error: 'no sections, bills or lists to watch in the notes file' }]);
   assert.ok(unknown.html.includes('<p>The nightly statute watch failed. It stopped with an error, given at the end of this email.</p>'), unknown.html);
   assert.ok(unknown.html.includes(FALLBACK_TODO), unknown.html);

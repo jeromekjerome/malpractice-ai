@@ -453,7 +453,7 @@ const decisions = ids => `decision${ids.length === 1 ? '' : 's'} ${listed(ids.ma
 const SAVED_ONLY = 'for a case type with fewer than 5 cleared decisions they use only the decisions saved from earlier searches, if any, and the citations in replies may be left unchecked.';
 function courtListenerVisitors(status) {
   if (status === 401 || status === 403) return `Visitors are affected until the token is fixed: replies search CourtListener with the same token, so ${SAVED_ONLY}`;
-  if (status === 429) return `Visitors may be affected until the hour's limit frees up: replies search CourtListener with the same token, so their searches may be refused too. Then, ${SAVED_ONLY}`;
+  if (status === 429) return `Visitors may be affected while the token's limits are spent: replies search CourtListener with the same token, so their searches may be refused too. Then, ${SAVED_ONLY}`;
   if (status === 0 || (status >= 500 && status <= 599)) return `If CourtListener is down, visitors are affected too: replies' live searches fail, so ${SAVED_ONLY}`;
   return null;
 }
@@ -510,8 +510,12 @@ function plainFailure(error) {
       todo: "If the reason is a refusal (status 401 or 403), check NYSENATE_API_KEY in the deployment's settings on Vercel. Otherwise the Senate's service was likely down: if it fails again tomorrow night, it needs a look.",
     };
   }
-  // Postgres names a table or column the code needs that the database lacks; the statute watch says so of its own table.
-  if (/\bdoes not exist\b/.test(text)) return { said: 'The database is missing a table or column the job needs.', todo: 'Run npm run setup-db against the production database (or ask Claude to).' };
+  // Postgres names, in its own words, a table or column the code needs that the database lacks (relation "x" does not exist,
+  // column "y" of relation "x" does not exist); the statute watch says so of its own table. Another service's "does not exist",
+  // such as the backup's storage bucket, is no database matter.
+  if (/\b(?:relation|column)\s+\S+(?:\s+of relation\s+\S+)?\s+does not exist\b/.test(text)) {
+    return { said: 'The database is missing a table or column the job needs.', todo: 'Run npm run setup-db against the production database (or ask Claude to).' };
+  }
   if (/Run npm run setup-db/.test(text)) {
     return {
       said: 'The job could not read or write its table in the database.',

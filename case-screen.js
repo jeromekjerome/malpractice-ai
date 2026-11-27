@@ -207,7 +207,7 @@ function foundCount(hits, more) {
 // not cleared.
 const CHOICES = {
   clear: '<li><strong>Clear</strong>: it goes back into the library and may be offered to replies again. The screen looks at it again in 30 days, passing over the later decisions it found this time.</li>',
-  again: '<li><strong>Screen again</strong>: it goes back in line, and the next run of the screen asks CourtListener about it again.</li>',
+  again: '<li><strong>Screen again</strong>: it goes back in line to be screened, behind the decisions not tried yet, and the screen asks CourtListener about it again when its turn comes.</li>',
   ban: '<li><strong>Ban</strong>: it is never offered to replies and never screened again.</li>',
 };
 const SAFE_DEFAULT = '<p>If you are not sure, leave it held. That is the safe default: a held decision is never offered to replies.</p>';

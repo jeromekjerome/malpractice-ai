@@ -752,7 +752,7 @@ test('the email about an unreadable hold says the owner can screen it again or b
     const { html } = mail.sent[0];
     assert.ok(html.includes(`The screen could not read CourtListener's answer for it ${said}.`), html);
     assert.ok(html.includes('<p>It waits for you on the <a href="https://nycinjury.ai/admin.html">admin page</a>, where you can screen it again or ban it:</p>'), html);
-    assert.ok(html.includes('<li><strong>Screen again</strong>: it goes back in line, and the next run of the screen asks CourtListener about it again.</li>'), html);
+    assert.ok(html.includes('<li><strong>Screen again</strong>: it goes back in line to be screened, behind the decisions not tried yet, and the screen asks CourtListener about it again when its turn comes.</li>'), html);
     assert.ok(html.includes('<li><strong>Ban</strong>: it is never offered to replies and never screened again.</li>'), html);
     assert.ok(html.includes(SAFE_DEFAULT), html);
     assert.doesNotMatch(html, /status 0|clear it or ban it|What to look for|The passage/);

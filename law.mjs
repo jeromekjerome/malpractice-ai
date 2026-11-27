@@ -383,10 +383,16 @@ function reviewed(args, { lawUrl, now, out, err }) {
     err(usage);
     return 2;
   }
-  const found = findSource(id, { lawUrl, err });
-  if (!found) return 1;
-  const { law, source } = found;
-  if (source.kind === 'listing') {
+  let law;
+  try {
+    law = readLawFile(lawUrl);
+  } catch (error) {
+    err(`The notes file was not read: ${error?.message ?? error}`);
+    return 1;
+  }
+  const sourceOf = other => listOf(law?.sources).find(candidate => candidate?.id === other && SOURCE_ID.test(other));
+  const source = sourceOf(id);
+  if (source?.kind === 'listing') {
     const valid = numbers.length > 0 && numbers.every(value => /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value)));
     if (!valid) {
       err(usage);
@@ -400,23 +406,27 @@ function reviewed(args, { lawUrl, now, out, err }) {
     out(`Marked opinions ${[...new Set(numbers.map(Number))].sort((a, b) => a - b).join(', ')} of ${id} as reviewed; reviewed_on is ${source.reviewed_on}. Commit the notes file and push it; the watch reads the deployed copy.`);
     return 0;
   }
-  if (source.kind !== 'by_hand') {
-    if (numbers.length) {
-      err(usage);
-      err(`${id} takes no numbers.`);
-      return 2;
-    }
+  // One id that cannot be reviewed is refused, as law approve refuses one (exit 1).
+  if (!numbers.length && !source) {
+    err(`${id} is not a source in the notes file; nothing was written.`);
+    return 1;
+  }
+  if (!numbers.length && source.kind !== 'by_hand') {
     err(`${id} is read from the Senate, so it is approved, not reviewed. Use: npm run law:approve -- ${id} <fingerprint>`);
     return 1;
   }
-  // Several sources kept by hand: each is checked before any is written, so either every one is recorded or none is.
+  // Several ids, all to be sources kept by hand: each is checked the same way wherever it stands, before any is written, so
+  // either every one is recorded or none is (exit 2, with the usage and every reason).
   const ids = [...new Set([id, ...numbers])];
-  const sources = ids.map(other => listOf(law.sources).find(candidate => candidate?.id === other && SOURCE_ID.test(other)));
+  const sources = ids.map(sourceOf);
   const problems = ids.map((other, index) => {
     const found = sources[index];
     if (!found) return `${other} is not a source in the notes file.`;
     if (found.kind === 'listing') return `${other} is the State Bar's list: mark its opinions reviewed on their own, with npm run law:reviewed -- ${other} <numbers>.`;
-    if (found.kind !== 'by_hand') return `${other} is read from the Senate, so it is approved, not reviewed. Use: npm run law:approve -- ${other} <fingerprint>`;
+    if (found.kind !== 'by_hand') {
+      return `${other} is read from the Senate, so it is approved, not reviewed (npm run law:approve -- ${other} <fingerprint>). `
+        + 'Leave it out and run law:reviewed again with the sources kept by hand alone.';
+    }
     return null;
   }).filter(Boolean);
   if (problems.length) {

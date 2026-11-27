@@ -551,10 +551,15 @@ test('law reviewed with several ids writes none of them when any is unknown or n
   try {
     const { file, deps } = byHandWorld(dir);
     const before = readFileSync(file, 'utf8');
+    // Wherever the bad id stands, first or later, the answer is the same.
+    const senate = id => new RegExp(`${id} is read from the Senate, so it is approved, not reviewed \\(npm run law:approve -- ${id} <fingerprint>\\)\\. `
+      + 'Leave it out and run law:reviewed again with the sources kept by hand alone\\.');
     const cases = [
-      [['reviewed', 'NYCAC-7-201', 'NYCAC-9-999'], /NYCAC-9-999 is not a source in the notes file/],
-      [['reviewed', 'NYCAC-7-201', 'CPLR-214'], /CPLR-214 is read from the Senate, so it is approved, not reviewed/],
-      [['reviewed', 'NYCAC-7-201', 'NYCAC-7-210', 'BILL-2025-S1'], /BILL-2025-S1 is read from the Senate/],
+      [['reviewed', 'NYCAC-7-201', 'NYCAC-9-999'], /NYCAC-9-999 is not a source in the notes file\./],
+      [['reviewed', 'NYCAC-9-999', 'NYCAC-7-201'], /NYCAC-9-999 is not a source in the notes file\./],
+      [['reviewed', 'NYCAC-7-201', 'CPLR-214'], senate('CPLR-214')],
+      [['reviewed', 'CPLR-214', 'NYCAC-7-201'], senate('CPLR-214')],
+      [['reviewed', 'NYCAC-7-201', 'NYCAC-7-210', 'BILL-2025-S1'], senate('BILL-2025-S1')],
     ];
     for (const [argv, reason] of cases) {
       const io = collecting();
